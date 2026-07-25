@@ -12,6 +12,11 @@ fail() {
 [ "$(uname -s)" = "Linux" ] || fail "Linux is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
 command -v curl >/dev/null 2>&1 || fail "curl is required"
+command -v grep >/dev/null 2>&1 || fail "grep is required"
+
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bundle_dir="$(cd "$script_dir/.." && pwd)"
@@ -26,6 +31,14 @@ agent_binary="$bundle_dir/bin/xenon-agent"
 printf '%s\n' \
   'WARNING: this installs an insecure loopback-only Xenon test environment.' \
   'Do not expose ports 50051 or 18081 publicly and do not use this mode in production.'
+
+systemctl stop xenon-agent.service xenon.service >/dev/null 2>&1 || true
+systemctl reset-failed xenon-agent.service xenon.service >/dev/null 2>&1 || true
+for port in 50051 18081 10085 18443; do
+  if port_in_use "$port"; then
+    fail "TCP port $port is already in use after stopping Xenon services; inspect: ss -ltnp 'sport = :$port'"
+  fi
+done
 
 install -d -o root -g root -m 0755 /var/lib/xenon
 if ! id xenon >/dev/null 2>&1; then
@@ -115,14 +128,14 @@ systemctl daemon-reload
 systemctl enable --now xenon.service
 
 for _ in $(seq 1 50); do
-  if curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null; then
+  if curl --fail --silent http://127.0.0.1:18081/healthz | grep -q '^ok$'; then
     break
   fi
   systemctl is-active --quiet xenon.service || \
     fail "Xenon stopped; inspect journalctl -u xenon"
   sleep 0.2
 done
-curl --fail --silent http://127.0.0.1:18081/healthz >/dev/null || \
+curl --fail --silent http://127.0.0.1:18081/healthz | grep -q '^ok$' || \
   fail "Xenon health check timed out"
 
 systemctl enable --now xenon-agent.service
@@ -132,6 +145,17 @@ for _ in $(seq 1 50); do
 done
 systemctl is-active --quiet xenon-agent.service || \
   fail "Agent stopped; inspect journalctl -u xenon-agent"
+
+for _ in $(seq 1 50); do
+  if port_in_use 10085; then
+    break
+  fi
+  systemctl is-active --quiet xenon-agent.service || \
+    fail "Agent stopped before embedded Xray became ready; inspect journalctl -u xenon-agent"
+  sleep 0.2
+done
+port_in_use 10085 || \
+  fail "embedded Xray API did not become ready; inspect journalctl -u xenon-agent"
 
 printf 'Xenon local test installation completed.\n'
 printf 'Health: http://127.0.0.1:18081/healthz\n'

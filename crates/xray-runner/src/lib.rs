@@ -114,6 +114,8 @@ mod platform {
         let mut command = Command::new(binary_path);
         command
             .arg("run")
+            .arg("-format")
+            .arg("json")
             .arg("-config")
             .arg(config_path)
             .stdin(Stdio::null())
@@ -207,8 +209,14 @@ mod tests {
     #[tokio::test]
     async fn memfd_supervisor_restarts_after_embedded_child_exit() {
         let mut supervisor = XraySupervisor::default();
-        let fake_xray =
-            b"#!/bin/sh\n[ \"$1\" = run ] || exit 10\n[ -r \"$3\" ] || exit 11\nexit 23\n";
+        let fake_xray = b"#!/bin/sh
+[ \"$1\" = run ] || exit 10
+[ \"$2\" = -format ] || exit 11
+[ \"$3\" = json ] || exit 12
+[ \"$4\" = -config ] || exit 13
+[ -r \"$5\" ] || exit 14
+exit 23
+";
         supervisor
             .start_binary(fake_xray, b"{}")
             .await
@@ -227,5 +235,25 @@ mod tests {
             .expect("restart fake embedded process");
         assert_eq!(supervisor.restart_count(), 1);
         supervisor.stop().await.expect("stop restarted process");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn embedded_xray_accepts_json_config_from_memfd() {
+        if !XraySupervisor::embedded_available() {
+            return;
+        }
+        let mut supervisor = XraySupervisor::default();
+        supervisor
+            .start(br#"{"log":{"loglevel":"none"},"inbounds":[],"outbounds":[]}"#)
+            .await
+            .expect("start embedded Xray with memfd JSON config");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let exit = supervisor.poll().expect("poll embedded Xray");
+        assert!(
+            exit.is_none(),
+            "embedded Xray exited during startup: {exit:?}"
+        );
+        supervisor.stop().await.expect("stop embedded Xray");
     }
 }

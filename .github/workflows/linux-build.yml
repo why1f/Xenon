@@ -116,6 +116,12 @@ jobs:
           grep -Fxq 'embedded_xray_available=true' <<<"$info"
           grep -Fxq "embedded_xray_sha256=${XRAY_BINARY_SHA256}" <<<"$info"
 
+      - name: Smoke-test embedded Xray memfd startup
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: >-
+          cargo test --locked --release -p xray-embedded-runner
+          embedded_xray_accepts_json_config_from_memfd
+
       - name: Package artifact
         env:
           ARTIFACT: ${{ matrix.artifact }}

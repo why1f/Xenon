@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.4 - 2026-07-26
+
+### Fixed
+
+- Pass the explicit JSON format to Xray when its configuration is provided through a memfd path.
+- Treat a stopped Panel gRPC, enrollment, or subscription server as a fatal process error instead of reporting a false healthy service.
+- Stop existing services, clear systemd start limits, reject occupied loopback ports, and wait for the Xray API in the test installer.
+
+### Tests
+
+- Start the real embedded Xray from a memfd configuration during x86_64 release CI.
+
 ## 0.1.0-alpha.3 - 2026-07-26
 
 ### Fixed

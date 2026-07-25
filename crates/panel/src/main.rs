@@ -146,9 +146,12 @@ async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
     let traffic_retention = config.traffic_retention.clone();
     let backup_database = database.clone();
     let backup_config = config.backup.clone();
+    let (server_failure_tx, mut server_failure_rx) =
+        tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
 
+    let grpc_failure_tx = server_failure_tx.clone();
     let grpc_task = tokio::spawn(async move {
-        if let Err(error) = grpc::serve(
+        let result = grpc::serve(
             grpc_addr,
             grpc_state,
             grpc_database,
@@ -156,29 +159,41 @@ async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
             grpc_registration,
             grpc_enrollment,
         )
-        .await
-        {
-            tracing::error!(%error, "panel gRPC server stopped");
-        }
+        .await;
+        let error = result
+            .context("panel gRPC server stopped")
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("panel gRPC server stopped unexpectedly"));
+        tracing::error!(%error, "critical Panel server stopped");
+        let _ = grpc_failure_tx.send(error);
     });
     let enrollment_task = if enrollment_enabled {
+        let enrollment_failure_tx = server_failure_tx.clone();
         Some(tokio::spawn(async move {
-            if let Err(error) =
-                grpc::serve_enrollment(enrollment_tls, enrollment_config, enrollment_database).await
-            {
-                tracing::error!(%error, "panel enrollment server stopped");
-            }
+            let result =
+                grpc::serve_enrollment(enrollment_tls, enrollment_config, enrollment_database)
+                    .await;
+            let error = result
+                .context("panel enrollment server stopped")
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("panel enrollment server stopped unexpectedly"));
+            tracing::error!(%error, "critical Panel server stopped");
+            let _ = enrollment_failure_tx.send(error);
         }))
     } else {
         None
     };
+    let http_failure_tx = server_failure_tx.clone();
     let http_task = tokio::spawn(async move {
-        if let Err(error) =
-            http::serve(http_addr, subscription_http, http_state, http_database).await
-        {
-            tracing::error!(%error, "subscription HTTP server stopped");
-        }
+        let result = http::serve(http_addr, subscription_http, http_state, http_database).await;
+        let error = result
+            .context("subscription HTTP server stopped")
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("subscription HTTP server stopped unexpectedly"));
+        tracing::error!(%error, "critical Panel server stopped");
+        let _ = http_failure_tx.send(error);
     });
+    drop(server_failure_tx);
     let traffic_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(
             traffic_retention.maintenance_interval_seconds,
@@ -237,19 +252,28 @@ async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
     };
 
     let headless = headless || std::env::var("PANEL_HEADLESS").is_ok_and(|value| value == "1");
-    let run_result = if headless {
-        info!("panel started in headless mode");
-        tokio::signal::ctrl_c().await.context("wait for Ctrl+C")
-    } else {
-        info!("panel started; press q to quit");
-        tui::run(
-            state,
-            database.clone(),
-            config.grpc_addr.clone(),
-            subscription_base_url,
-            config.agent_install.clone(),
-        )
-        .await
+    let interaction = async {
+        if headless {
+            info!("panel started in headless mode");
+            tokio::signal::ctrl_c().await.context("wait for Ctrl+C")
+        } else {
+            info!("panel started; press q to quit");
+            tui::run(
+                state,
+                database.clone(),
+                config.grpc_addr.clone(),
+                subscription_base_url,
+                config.agent_install.clone(),
+            )
+            .await
+        }
+    };
+    tokio::pin!(interaction);
+    let run_result = tokio::select! {
+        result = &mut interaction => result,
+        error = server_failure_rx.recv() => Err(error.unwrap_or_else(|| {
+            anyhow::anyhow!("all Panel network server tasks stopped unexpectedly")
+        })),
     };
     grpc_task.abort();
     if let Some(task) = enrollment_task {
