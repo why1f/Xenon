@@ -1,0 +1,23 @@
+[Unit]
+Description=Xenon Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xenon-agent
+Group=xenon-agent
+WorkingDirectory=/var/lib/xenon/agent
+Environment=AGENT_CONFIG=/var/lib/xenon/agent/agent.toml
+ExecStart=/usr/local/bin/xenon-agent
+Restart=always
+RestartSec=1s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xenon/agent
+
+[Install]
+WantedBy=multi-user.target

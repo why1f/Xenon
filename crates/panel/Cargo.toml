@@ -1,0 +1,37 @@
+[package]
+name = "xenon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+base64 = "0.22"
+chrono.workspace = true
+crossterm.workspace = true
+fs2.workspace = true
+ratatui.workspace = true
+rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+url.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+xenon-domain = { path = "../domain" }
+xenon-protocol = { path = "../protocol" }
+xenon-storage = { path = "../storage" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,39 @@
+panel_endpoint = "https://127.0.0.1:55051"
+agent_id = "agent-mtls-dev"
+node_id = "node-mtls-dev"
+registration_token = "development-only"
+interval_seconds = 1
+
+[tls]
+enabled = true
+ca_path = "dev-certs/ca.crt"
+cert_path = "dev-certs/agent.crt"
+key_path = "dev-certs/agent.key"
+domain_name = "panel.internal"
+enrollment_endpoint = "https://127.0.0.1:55052"
+renew_before_days = 14
+
+[xray]
+api_endpoint = "http://127.0.0.1:10085"
+inbound_tag = "vless-in"
+# The Agent generates the minimal Xray server config from these fields.
+listen_address = "0.0.0.0"
+listen_port = 443
+protocol = "vless"
+transport = "tcp"
+security = "none"
+# TLS/Reality fields are required when security is changed from none.
+# server_name = "www.example.com"
+# tls_certificate_path = "/etc/xenon/tls/server.crt"
+# tls_key_path = "/etc/xenon/tls/server.key"
+# reality_private_key = "..."
+# reality_dest = "www.cloudflare.com:443"
+# reality_short_ids = ["abcd"]
+# reality_fingerprint = "chrome"
+# Optional: a complete Xray JSON config loaded into memfd at startup.
+# bootstrap_json = '{"log":{"loglevel":"warning"}}'
+
+[spool]
+path = "/var/lib/xenon/agent/traffic-spool.json"
+max_batches = 2048
+max_bytes = 16777216

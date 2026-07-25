@@ -1,0 +1,22 @@
+[Unit]
+Description=Xenon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xenon
+Group=xenon
+WorkingDirectory=/var/lib/xenon/panel
+Environment=XENON_CONFIG=/etc/xenon/xenon.toml
+ExecStart=/usr/local/bin/xenon --headless
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xenon/panel
+
+[Install]
+WantedBy=multi-user.target

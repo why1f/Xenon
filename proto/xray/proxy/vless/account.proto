@@ -1,0 +1,11 @@
+syntax = "proto3";
+package xray.proxy.vless;
+
+message Account {
+  string id = 1;
+  string flow = 2;
+  string encryption = 3;
+  uint32 xorMode = 4;
+  uint32 seconds = 5;
+  string padding = 6;
+}

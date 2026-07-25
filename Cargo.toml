@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/domain",
+    "crates/protocol",
+    "crates/storage",
+    "crates/xray-protocol",
+    "crates/xray-runner",
+    "crates/panel",
+    "crates/agent",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.28"
+fs2 = "0.4"
+libc = "0.2"
+prost = "0.13"
+ratatui = "0.29"
+rcgen = { version = "=0.14.7", features = ["x509-parser"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+thiserror = "2"
+time = "=0.3.36"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+url = "2"
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = true
+codegen-units = 1
+panic = "abort"

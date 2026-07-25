@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package panel_agent;
+
+service AgentControl {
+  rpc OpenStream(stream AgentToPanel) returns (stream PanelToAgent);
+  rpc RotateCertificate(RotateCertificateRequest) returns (EnrollResponse);
+}
+
+service AgentEnrollment {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string agent_version = 3;
+  string xray_version = 4;
+  string max_supported_xray_version = 5;
+  string registration_token = 6;
+  string csr_pem = 7;
+  string protocol_version = 8;
+}
+
+message EnrollResponse {
+  bool accepted = 1;
+  string message = 2;
+  string certificate_pem = 3;
+  string client_ca_pem = 4;
+  int64 expires_at_unix = 5;
+}
+
+message RotateCertificateRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string max_supported_xray_version = 3;
+  string csr_pem = 4;
+  string protocol_version = 5;
+}
+
+message AgentToPanel {
+  oneof payload {
+    RegisterRequest register = 1;
+    Heartbeat heartbeat = 2;
+    InterfaceSnapshotBatch interfaces = 3;
+    XrayTrafficBatch xray_traffic = 4;
+    DesiredStateAck desired_state_ack = 5;
+    SystemSnapshot system = 6;
+  }
+}
+
+message PanelToAgent {
+  oneof payload {
+    RegisterResponse register = 1;
+    DesiredStateSnapshot desired_state = 2;
+    TrafficAck traffic_ack = 3;
+    RestartXray restart_xray = 4;
+  }
+}
+
+message RegisterRequest {
+  string agent_id = 1;
+  string node_id = 2;
+  string agent_version = 3;
+  string xray_version = 4;
+  string registration_token = 5;
+  string max_supported_xray_version = 6;
+  string protocol_version = 7;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string message = 2;
+  string panel_protocol_version = 3;
+}
+
+message Heartbeat {
+  string agent_id = 1;
+  string node_id = 2;
+  uint64 sent_at_unix = 3;
+  uint64 uptime_seconds = 4;
+  uint64 desired_revision = 5;
+  uint64 applied_revision = 6;
+  bool xray_running = 7;
+  uint64 xray_restart_count = 8;
+}
+
+message InterfaceSnapshotBatch {
+  string agent_id = 1;
+  string node_id = 2;
+  string boot_id = 3;
+  uint64 sequence = 4;
+  uint64 sampled_at_unix = 5;
+  repeated InterfaceSnapshot interfaces = 6;
+}
+
+message InterfaceSnapshot {
+  string name = 1;
+  uint64 rx_bytes = 2;
+  uint64 tx_bytes = 3;
+}
+
+message SystemSnapshot {
+  string agent_id = 1;
+  string node_id = 2;
+  uint64 sequence = 3;
+  uint64 sampled_at_unix = 4;
+  uint32 cpu_usage_basis_points = 5;
+  uint64 load_1_milli = 6;
+  uint64 load_5_milli = 7;
+  uint64 load_15_milli = 8;
+  uint64 memory_total_bytes = 9;
+  uint64 memory_used_bytes = 10;
+  uint64 disk_total_bytes = 11;
+  uint64 disk_used_bytes = 12;
+}
+
+message XrayTrafficBatch {
+  string agent_id = 1;
+  string node_id = 2;
+  string xray_instance_id = 3;
+  uint64 sequence = 4;
+  uint64 interval_start_unix = 5;
+  uint64 interval_end_unix = 6;
+  repeated XrayUserTraffic users = 7;
+}
+
+message XrayUserTraffic {
+  string subscription_id = 1;
+  string xray_email = 2;
+  uint64 uplink_delta = 3;
+  uint64 downlink_delta = 4;
+}
+
+message TrafficAck {
+  string batch_id = 1;
+  uint64 accepted_sequence = 2;
+}
+
+message DesiredStateSnapshot {
+  uint64 revision = 1;
+  repeated XrayUser desired_users = 2;
+}
+
+message XrayUser {
+  string subscription_id = 1;
+  string xray_email = 2;
+  string uuid = 3;
+  bool enabled = 4;
+}
+
+message DesiredStateAck {
+  string agent_id = 1;
+  string node_id = 2;
+  uint64 revision = 3;
+  uint32 success_count = 4;
+  uint32 failure_count = 5;
+  string error_message = 6;
+}
+
+message RestartXray {
+  string command_id = 1;
+}

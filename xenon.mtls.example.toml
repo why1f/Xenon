@@ -1,0 +1,52 @@
+grpc_addr = "127.0.0.1:55051"
+http_addr = "127.0.0.1:18082"
+database_path = "target/mtls-xenon.db"
+
+[subscription_http]
+tls_enabled = true
+cert_path = "dev-certs/server.crt"
+key_path = "dev-certs/server.key"
+public_base_url = "https://panel.internal:18082"
+requests_per_minute_per_ip = 120
+requests_per_minute_per_token = 60
+
+[traffic_retention]
+maintenance_interval_seconds = 3600
+raw_event_days = 30
+interface_snapshot_days = 30
+system_snapshot_days = 7
+hourly_aggregate_days = 0
+daily_aggregate_days = 0
+
+[backup]
+enabled = false
+directory = "target/backups"
+interval_hours = 24
+retain_count = 7
+
+[tls]
+enabled = true
+cert_path = "dev-certs/server.crt"
+key_path = "dev-certs/server.key"
+client_ca_path = "dev-certs/ca.crt"
+
+[registration]
+allow_insecure_dev_token = true
+
+[enrollment]
+enabled = true
+addr = "127.0.0.1:55052"
+ca_cert_path = "dev-certs/ca.crt"
+ca_key_path = "dev-certs/ca.key"
+certificate_valid_days = 90
+
+[agent_install]
+enabled = false
+script_url = "https://downloads.example.com/install-agent.sh"
+binary_url = "https://downloads.example.com/xenon-agent-x86_64"
+binary_sha256 = ""
+binary_version = ""
+ca_url = "https://downloads.example.com/panel-ca.crt"
+panel_endpoint = "https://panel.example.com:55051"
+enrollment_endpoint = "https://panel.example.com:55052"
+server_name = "panel.internal"
