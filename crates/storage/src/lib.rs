@@ -828,7 +828,10 @@ impl Database {
         Ok(true)
     }
 
-    pub async fn list_user_summaries(&self) -> Result<Vec<models::UserSummary>, StorageError> {
+    pub async fn list_user_summaries(
+        &self,
+        now: i64,
+    ) -> Result<Vec<models::UserSummary>, StorageError> {
         let rows = sqlx::query_as::<_, models::UserSummary>(
             "SELECT
                 u.id,
@@ -836,12 +839,26 @@ impl Database {
                 u.display_name,
                 u.status,
                 COUNT(usage.subscription_id) AS subscription_count,
-                COALESCE(SUM(usage.charged_bytes), 0) AS charged_bytes
+                COALESCE(SUM(usage.charged_bytes), 0) AS charged_bytes,
+                CASE
+                    WHEN SUM(CASE
+                        WHEN usage.subscription_id IS NOT NULL
+                             AND usage.traffic_limit_bytes IS NULL THEN 1
+                        ELSE 0
+                    END) > 0 THEN NULL
+                    ELSE SUM(usage.traffic_limit_bytes)
+                END AS traffic_limit_bytes,
+                COALESCE(SUM(usage.expired), 0) AS expired_subscriptions
              FROM users u
              LEFT JOIN (
                  SELECT
                      s.id AS subscription_id,
                      s.user_id,
+                     s.traffic_limit_bytes,
+                     CASE
+                         WHEN s.expires_at IS NOT NULL AND s.expires_at <= ? THEN 1
+                         ELSE 0
+                     END AS expired,
                      COALESCE(SUM(a.uplink_bytes + a.downlink_bytes), 0)
                          * s.traffic_multiplier_basis_points / 10000 AS charged_bytes
                  FROM subscriptions s
@@ -849,14 +866,43 @@ impl Database {
                    ON a.subscription_id = s.id
                   AND a.granularity = 'cycle'
                   AND a.bucket_start = s.current_cycle_start
-                 GROUP BY s.id, s.user_id, s.traffic_multiplier_basis_points
+                 GROUP BY s.id, s.user_id, s.traffic_multiplier_basis_points,
+                          s.traffic_limit_bytes, s.expires_at
              ) usage ON usage.user_id = u.id
              GROUP BY u.id, u.username, u.display_name, u.status
              ORDER BY charged_bytes DESC, u.username ASC",
         )
+        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn latest_nic_totals(
+        &self,
+    ) -> Result<Option<models::NicCounterTotals>, StorageError> {
+        let totals = sqlx::query_as::<_, models::NicCounterTotals>(
+            "WITH ranked AS (
+                SELECT rx_absolute, tx_absolute, sampled_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY node_id, interface_name
+                           ORDER BY sampled_at DESC, sequence DESC
+                       ) AS rn
+                FROM interface_snapshots
+             )
+             SELECT COALESCE(SUM(rx_absolute), 0) AS rx_bytes,
+                    COALESCE(SUM(tx_absolute), 0) AS tx_bytes,
+                    COALESCE(MAX(sampled_at), 0) AS sampled_at
+             FROM ranked
+             WHERE rn = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if totals.sampled_at == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(totals))
+        }
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<models::NodeRecord>, StorageError> {
@@ -1256,7 +1302,19 @@ impl Database {
                            AND a.granularity = 'cycle'
                            AND a.bucket_start = s.current_cycle_start)
                         * s.traffic_multiplier_basis_points / 10000
-                    ), 0) AS charged_bytes
+                    ), 0) AS charged_bytes,
+                    CASE
+                        WHEN SUM(CASE
+                            WHEN s.id IS NOT NULL AND s.traffic_limit_bytes IS NULL THEN 1
+                            ELSE 0
+                        END) > 0 THEN NULL
+                        ELSE SUM(s.traffic_limit_bytes)
+                    END AS traffic_limit_bytes,
+                    COALESCE(SUM(CASE
+                        WHEN s.expires_at IS NOT NULL
+                             AND s.expires_at <= CAST(strftime('%s', 'now') AS INTEGER) THEN 1
+                        ELSE 0
+                    END), 0) AS expired_subscriptions
              FROM users u
              LEFT JOIN subscriptions s ON s.user_id = u.id
              WHERE u.id = ?
@@ -2434,7 +2492,7 @@ mod tests {
             .await
             .expect("create user subscription");
 
-        let users = database.list_user_summaries().await.expect("list users");
+        let users = database.list_user_summaries(0).await.expect("list users");
         assert_eq!(users.len(), 2);
         let alice = users
             .iter()
@@ -3154,7 +3212,7 @@ mod tests {
         assert_eq!(cycle_start, 86_410);
         assert_eq!(
             database
-                .list_user_summaries()
+                .list_user_summaries(0)
                 .await
                 .expect("new cycle summary")
                 .into_iter()

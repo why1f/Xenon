@@ -6,6 +6,15 @@ pub struct UserSummary {
     pub status: String,
     pub subscription_count: i64,
     pub charged_bytes: i64,
+    pub traffic_limit_bytes: Option<i64>,
+    pub expired_subscriptions: i64,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct NicCounterTotals {
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+    pub sampled_at: i64,
 }
 
 #[derive(Debug, Clone)]

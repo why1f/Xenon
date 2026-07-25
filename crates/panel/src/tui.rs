@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
     Terminal,
 };
 use std::{io, sync::Arc, time::Duration};
@@ -28,6 +28,68 @@ struct TuiSnapshot {
     interfaces: Vec<models::InterfaceRecord>,
     user_detail: Option<models::UserDetail>,
     notice: String,
+    down_rate_bps: u64,
+    up_rate_bps: u64,
+    down_rate_history: Vec<u64>,
+    up_rate_history: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+struct NicRateTracker {
+    last_sample: Option<(i64, i64, i64)>,
+    down_rate_bps: u64,
+    up_rate_bps: u64,
+    down_history: std::collections::VecDeque<u64>,
+    up_history: std::collections::VecDeque<u64>,
+}
+
+impl NicRateTracker {
+    const HISTORY_CAPACITY: usize = 240;
+
+    fn observe(&mut self, totals: Option<models::NicCounterTotals>) {
+        if let Some(totals) = totals {
+            match self.last_sample {
+                Some((sampled_at, rx, tx)) if totals.sampled_at > sampled_at => {
+                    let elapsed = (totals.sampled_at - sampled_at) as u64;
+                    let delta_rx = totals.rx_bytes - rx;
+                    let delta_tx = totals.tx_bytes - tx;
+                    // Negative deltas mean the absolute counters were reset
+                    // (agent reboot / new boot_id); re-baseline instead of
+                    // rendering a bogus spike.
+                    if delta_rx >= 0 && delta_tx >= 0 && elapsed > 0 {
+                        self.down_rate_bps = delta_rx as u64 / elapsed;
+                        self.up_rate_bps = delta_tx as u64 / elapsed;
+                    } else {
+                        self.down_rate_bps = 0;
+                        self.up_rate_bps = 0;
+                    }
+                    self.last_sample = Some((totals.sampled_at, totals.rx_bytes, totals.tx_bytes));
+                }
+                Some(_) => {}
+                None => {
+                    self.last_sample = Some((totals.sampled_at, totals.rx_bytes, totals.tx_bytes));
+                }
+            }
+        } else {
+            self.down_rate_bps = 0;
+            self.up_rate_bps = 0;
+        }
+        self.down_history.push_back(self.down_rate_bps);
+        self.up_history.push_back(self.up_rate_bps);
+        while self.down_history.len() > Self::HISTORY_CAPACITY {
+            self.down_history.pop_front();
+        }
+        while self.up_history.len() > Self::HISTORY_CAPACITY {
+            self.up_history.pop_front();
+        }
+    }
+
+    fn apply(&self, snapshot: &mut TuiSnapshot) {
+        snapshot.down_rate_bps = self.down_rate_bps;
+        snapshot.up_rate_bps = self.up_rate_bps;
+        snapshot.down_rate_history = self.down_history.iter().copied().collect();
+        snapshot.up_rate_history = self.up_history.iter().copied().collect();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +200,7 @@ pub async fn run(
     let mut tui_task = tokio::task::spawn_blocking(move || run_blocking(snapshot_rx, command_tx));
     let mut refresh = tokio::time::interval(Duration::from_secs(2));
     let mut user_detail = None;
+    let mut rate_tracker = NicRateTracker::default();
 
     loop {
         tokio::select! {
@@ -146,7 +209,9 @@ pub async fn run(
                 break;
             }
             _ = refresh.tick() => {
-                let snapshot = load_snapshot(&state, &database, String::new(), user_detail.clone()).await?;
+                rate_tracker.observe(database.latest_nic_totals().await.unwrap_or_default());
+                let mut snapshot = load_snapshot(&state, &database, String::new(), user_detail.clone()).await?;
+                rate_tracker.apply(&mut snapshot);
                 if snapshot_tx.send(snapshot).is_err() {
                     break;
                 }
@@ -271,7 +336,11 @@ pub async fn run(
                     Ok(message) => message,
                     Err(error) => format!("operation failed: {error}"),
                 };
-                let snapshot = load_snapshot(&state, &database, notice, user_detail.clone()).await?;
+                let snapshot = {
+                    let mut snapshot = load_snapshot(&state, &database, notice, user_detail.clone()).await?;
+                    rate_tracker.apply(&mut snapshot);
+                    snapshot
+                };
                 if snapshot_tx.send(snapshot).is_err() {
                     break;
                 }
@@ -563,11 +632,12 @@ async fn load_snapshot(
     Ok(TuiSnapshot {
         connected_agents,
         last_agent_event,
-        users: database.list_user_summaries().await?,
+        users: database.list_user_summaries(Utc::now().timestamp()).await?,
         nodes: database.list_node_overviews().await?,
         interfaces: database.list_recent_interfaces().await?,
         user_detail,
         notice,
+        ..TuiSnapshot::default()
     })
 }
 
@@ -1689,11 +1759,15 @@ fn draw_dashboard(
         return;
     }
 
+    let rate_height = if area.height >= 30 { 7 } else { 0 };
+    let stats_height = if area.height >= 22 { 3 } else { 0 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(5),
+            Constraint::Length(rate_height),
+            Constraint::Length(stats_height),
             Constraint::Min(6),
             Constraint::Length(8),
         ])
@@ -1772,6 +1846,93 @@ fn draw_dashboard(
         resource_label(disk_used, disk_total),
     );
 
+    if rate_height > 0 {
+        let charts = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(areas[2]);
+        let down_title = format!("↓ 下行  {}/s", format_bytes(snapshot.down_rate_bps as i64));
+        frame.render_widget(
+            Sparkline::default()
+                .data(&snapshot.down_rate_history)
+                .style(Style::default().fg(Color::Blue))
+                .block(panel_block(&down_title)),
+            charts[0],
+        );
+        let up_title = format!("↑ 上行  {}/s", format_bytes(snapshot.up_rate_bps as i64));
+        frame.render_widget(
+            Sparkline::default()
+                .data(&snapshot.up_rate_history)
+                .style(Style::default().fg(Color::Magenta))
+                .block(panel_block(&up_title)),
+            charts[1],
+        );
+    }
+
+    if stats_height > 0 {
+        let enabled = snapshot
+            .users
+            .iter()
+            .filter(|user| user.status == "active")
+            .count();
+        let over_quota = snapshot
+            .users
+            .iter()
+            .filter(|user| {
+                user.traffic_limit_bytes
+                    .is_some_and(|limit| limit > 0 && user.charged_bytes >= limit)
+            })
+            .count();
+        let expired = snapshot
+            .users
+            .iter()
+            .filter(|user| user.expired_subscriptions > 0)
+            .count();
+        let total_charged = snapshot
+            .users
+            .iter()
+            .map(|user| user.charged_bytes)
+            .fold(0_i64, i64::saturating_add);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("用户 "),
+                Span::styled(
+                    snapshot.users.len().to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  启用:"),
+                Span::styled(enabled.to_string(), Style::default().fg(Color::Green)),
+                Span::raw("  超额:"),
+                Span::styled(
+                    over_quota.to_string(),
+                    Style::default().fg(if over_quota > 0 {
+                        Color::Red
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::raw("  到期:"),
+                Span::styled(
+                    expired.to_string(),
+                    Style::default().fg(if expired > 0 {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::raw("    本周期计费 "),
+                Span::styled(
+                    format_bytes(total_charged),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]))
+            .block(panel_block("用户摘要")),
+            areas[3],
+        );
+    }
+
     let max_usage = snapshot
         .users
         .iter()
@@ -1784,6 +1945,7 @@ fn draw_dashboard(
             Cell::from(user.status.clone()).style(Style::default().fg(status_color(&user.status))),
             Cell::from(user.subscription_count.to_string()),
             Cell::from(format_bytes(user.charged_bytes)),
+            Cell::from(quota_label(user)),
             Cell::from(usage_bar(user.charged_bytes, max_usage, 18)),
         ])
         .style(selected_style(index == selected_user))
@@ -1792,10 +1954,11 @@ fn draw_dashboard(
     let users = Table::new(
         user_rows,
         [
-            Constraint::Percentage(25),
+            Constraint::Percentage(22),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(13),
+            Constraint::Length(16),
             Constraint::Min(12),
         ],
     )
@@ -1804,11 +1967,12 @@ fn draw_dashboard(
         "状态",
         "订阅",
         "Xray 计费",
+        "额度",
         "相对用量",
     ]))
     .column_spacing(1)
     .block(panel_block(&users_title));
-    frame.render_widget(users, areas[2]);
+    frame.render_widget(users, areas[4]);
 
     let node_rows = snapshot.nodes.iter().take(5).map(|node| {
         Row::new(vec![
@@ -1846,7 +2010,17 @@ fn draw_dashboard(
     ]))
     .column_spacing(1)
     .block(panel_block(&nodes_title));
-    frame.render_widget(nodes, areas[3]);
+    frame.render_widget(nodes, areas[5]);
+}
+
+fn quota_label(user: &models::UserSummary) -> String {
+    match user.traffic_limit_bytes {
+        Some(limit) if limit > 0 => {
+            let percent = user.charged_bytes as f64 / limit as f64 * 100.0;
+            format!("{} {:.1}%", format_bytes(limit), percent)
+        }
+        _ => "∞".to_string(),
+    }
 }
 
 fn draw_nodes(
@@ -2688,11 +2862,52 @@ fn format_bytes(value: i64) -> String {
 mod tests {
     use super::{
         agent_upgrade_command, create_node, create_subscription, format_bytes, format_reset_policy,
-        CreateNodeInput, CreateSubscriptionInput, FormState, NicBindingFormState, NodeFormState,
-        SubscriptionEditFormState, TuiSnapshot,
+        CreateNodeInput, CreateSubscriptionInput, FormState, NicBindingFormState, NicRateTracker,
+        NodeFormState, SubscriptionEditFormState, TuiSnapshot,
     };
     use ratatui::{backend::TestBackend, style::Color, Terminal};
     use xenon_storage::{models, Database};
+
+    #[test]
+    fn nic_rate_tracker_computes_rates_and_rebaselines_on_counter_reset() {
+        let mut tracker = NicRateTracker::default();
+        tracker.observe(Some(models::NicCounterTotals {
+            rx_bytes: 1_000,
+            tx_bytes: 500,
+            sampled_at: 100,
+        }));
+        assert_eq!(tracker.down_rate_bps, 0);
+        tracker.observe(Some(models::NicCounterTotals {
+            rx_bytes: 21_000,
+            tx_bytes: 10_500,
+            sampled_at: 110,
+        }));
+        assert_eq!(tracker.down_rate_bps, 2_000);
+        assert_eq!(tracker.up_rate_bps, 1_000);
+        // Same sample again: rate holds, history still advances.
+        tracker.observe(Some(models::NicCounterTotals {
+            rx_bytes: 21_000,
+            tx_bytes: 10_500,
+            sampled_at: 110,
+        }));
+        assert_eq!(tracker.down_rate_bps, 2_000);
+        assert_eq!(tracker.down_history.len(), 3);
+        // Counter reset (agent reboot) must not produce a negative spike.
+        tracker.observe(Some(models::NicCounterTotals {
+            rx_bytes: 40,
+            tx_bytes: 20,
+            sampled_at: 120,
+        }));
+        assert_eq!(tracker.down_rate_bps, 0);
+        assert_eq!(tracker.up_rate_bps, 0);
+        tracker.observe(Some(models::NicCounterTotals {
+            rx_bytes: 1_040,
+            tx_bytes: 520,
+            sampled_at: 130,
+        }));
+        assert_eq!(tracker.down_rate_bps, 100);
+        assert_eq!(tracker.up_rate_bps, 50);
+    }
 
     #[test]
     fn renders_every_page_in_a_small_terminal_without_panicking() {
@@ -2749,6 +2964,8 @@ mod tests {
                 status: "active".into(),
                 subscription_count: 2,
                 charged_bytes: 8 * 1024 * 1024,
+                traffic_limit_bytes: Some(500 * 1024 * 1024 * 1024),
+                expired_subscriptions: 0,
             }],
             nodes: vec![models::NodeOverview {
                 id: "node-a".into(),
@@ -2860,7 +3077,7 @@ mod tests {
         .expect("create subscription");
 
         assert!(notice.contains("http://127.0.0.1:18181/sub/"));
-        let users = database.list_user_summaries().await.expect("users");
+        let users = database.list_user_summaries(0).await.expect("users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].username, "alice");
         let subscriptions = database
