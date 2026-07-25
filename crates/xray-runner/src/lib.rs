@@ -139,15 +139,21 @@ mod platform {
 
     fn create_sealed_memfd(name: &str, bytes: &[u8]) -> anyhow::Result<File> {
         let name = CString::new(name)?;
-        // SAFETY: name is a valid NUL-terminated C string and flags are Linux
-        // memfd_create constants. Ownership of the returned fd is transferred
-        // exactly once to File below.
-        let fd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        // Call the kernel directly so release binaries do not require glibc's
+        // memfd_create wrapper, which was only added in glibc 2.27.
+        // SAFETY: name is NUL-terminated and the remaining arguments match the
+        // Linux memfd_create syscall ABI.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
         };
-        if fd < 0 {
+        if result < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let fd = result as std::os::fd::RawFd;
         // SAFETY: fd was just created successfully and has no other owner.
         let mut file = unsafe { File::from_raw_fd(fd) };
         file.write_all(bytes)?;
