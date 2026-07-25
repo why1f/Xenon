@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.2 - 2026-07-26
+
+### Added
+
+- Loopback-only single-host test installer in `scripts/install-test.sh`.
+- CI syntax checks for all Bash scripts.
+
+### Fixed
+
+- Grant the non-root Agent service `CAP_NET_BIND_SERVICE` so embedded Xray can bind port 443.
+
 ## 0.1.0-alpha.1 - 2026-07-26
 
 First Xenon test release.

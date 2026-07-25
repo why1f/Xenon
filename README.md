@@ -152,6 +152,35 @@ xenon-linux-aarch64.tar.gz.sha256
 
 压缩包包含 `xenon`、已嵌入对应架构 Xray 的 `xenon-agent`、systemd 单元、Agent 安装器、项目许可证和 Xray 许可证。Actions artifact 是测试制品；正式发布仍应创建版本标签、保留摘要并完成 Linux E2E 后再对外提供。
 
+### 单机一键测试安装
+
+release 压缩包内的 `scripts/install-test.sh` 可在一台使用 systemd 的 Linux 测试机上同时安装 Xenon 和 Agent：
+
+```bash
+sha256sum -c xenon-linux-<arch>.tar.gz.sha256
+tar -xzf xenon-linux-<arch>.tar.gz
+cd xenon-linux-<arch>
+sudo ./scripts/install-test.sh
+```
+
+该脚本仅创建回环测试环境：控制端口、订阅端口和 Xray 入站均只监听 `127.0.0.1`，使用 `development-only` 注册口令且不启用 TLS，不能用于生产或公网监听。安装后检查：
+
+```bash
+curl http://127.0.0.1:18081/healthz
+sudo systemctl status xenon xenon-agent
+sudo journalctl -u xenon -u xenon-agent -f
+```
+
+进入 TUI 前需停止 headless 主控，退出 TUI 后再恢复服务：
+
+```bash
+sudo systemctl stop xenon
+sudo -u xenon XENON_CONFIG=/etc/xenon/xenon.toml /usr/local/bin/xenon
+sudo systemctl start xenon
+```
+
+正式多服务器部署不要使用 `install-test.sh`。应在启用 mTLS/Enrollment 的 Xenon 中创建节点，再执行 TUI 生成的 `scripts/install-agent.sh` 命令；生产安装器不会接受明文下载地址。
+
 将 `xenon.toml` 的 `[tls]` 文件路径指向 `dev-certs/server.crt`、`server.key`、`ca.crt`，将 `agent.toml` 的 `[tls]` 文件路径指向 `ca.crt`、`agent.crt`、`agent.key`，并将 Agent 的地址改为 `https://panel.internal:50051`。开发机需要将 `panel.internal` 解析到 Xenon 地址。证书脚本只用于本地测试，不能代替生产 CA、证书轮换和一次性注册 Token。
 
 ## 目录

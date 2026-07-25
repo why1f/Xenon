@@ -177,6 +177,7 @@ fi
 
 download "$CA_URL" "$tmp_dir/panel-ca.crt"
 
+install -d -o root -g root -m 0755 /var/lib/xenon
 if ! id xenon-agent >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/xenon/agent --create-home \
     --shell /usr/sbin/nologin xenon-agent
@@ -238,6 +239,8 @@ Restart=always
 RestartSec=1s
 KillMode=control-group
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true

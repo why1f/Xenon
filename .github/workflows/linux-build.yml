@@ -18,6 +18,7 @@ on:
       - "packaging/**"
       - "proto/**"
       - "scripts/install-agent.sh"
+      - "scripts/install-test.sh"
       - "xenon.toml.example"
 
 permissions:
@@ -46,6 +47,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check shell scripts
+        run: bash -n scripts/*.sh
 
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
@@ -109,6 +113,7 @@ jobs:
           install -m 0644 packaging/xenon.service "$root/systemd/xenon.service"
           install -m 0644 packaging/xenon-agent.service "$root/systemd/xenon-agent.service"
           install -m 0755 scripts/install-agent.sh "$root/scripts/install-agent.sh"
+          install -m 0755 scripts/install-test.sh "$root/scripts/install-test.sh"
           install -m 0644 xenon.toml.example "$root/examples/xenon.toml.example"
           install -m 0644 agent.toml.example "$root/examples/agent.toml.example"
           install -m 0644 CHANGELOG.md "$root/CHANGELOG.md"
