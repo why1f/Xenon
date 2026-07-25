@@ -30,11 +30,18 @@ agent_binary="$bundle_dir/bin/xenon-agent"
 
 printf '%s\n' \
   'WARNING: this installs an insecure loopback-only Xenon test environment.' \
-  'Do not expose ports 50051 or 18081 publicly and do not use this mode in production.'
+  'Do not expose ports 50051 or 18181 publicly and do not use this mode in production.'
 
 systemctl stop xenon-agent.service xenon.service >/dev/null 2>&1 || true
 systemctl reset-failed xenon-agent.service xenon.service >/dev/null 2>&1 || true
-for port in 50051 18081 10085 18443; do
+if [ -f /etc/xenon/xenon.toml ] && \
+  grep -Fxq 'http_addr = "127.0.0.1:18081"' /etc/xenon/xenon.toml; then
+  sed -i 's/^http_addr = "127\.0\.0\.1:18081"$/http_addr = "127.0.0.1:18181"/' \
+    /etc/xenon/xenon.toml
+  chown root:xenon /etc/xenon/xenon.toml
+  chmod 0640 /etc/xenon/xenon.toml
+fi
+for port in 50051 18181 10085 18443; do
   if port_in_use "$port"; then
     fail "TCP port $port is already in use after stopping Xenon services; inspect: ss -ltnp 'sport = :$port'"
   fi
@@ -59,7 +66,7 @@ install -d -o xenon-agent -g xenon-agent -m 0700 /var/lib/xenon/agent
 if [ ! -e /etc/xenon/xenon.toml ]; then
   cat > /etc/xenon/xenon.toml <<'EOF'
 grpc_addr = "127.0.0.1:50051"
-http_addr = "127.0.0.1:18081"
+http_addr = "127.0.0.1:18181"
 database_path = "/var/lib/xenon/panel/xenon.db"
 
 [subscription_http]
@@ -128,14 +135,14 @@ systemctl daemon-reload
 systemctl enable --now xenon.service
 
 for _ in $(seq 1 50); do
-  if curl --fail --silent http://127.0.0.1:18081/healthz | grep -q '^ok$'; then
+  if curl --fail --silent http://127.0.0.1:18181/healthz | grep -q '^ok$'; then
     break
   fi
   systemctl is-active --quiet xenon.service || \
     fail "Xenon stopped; inspect journalctl -u xenon"
   sleep 0.2
 done
-curl --fail --silent http://127.0.0.1:18081/healthz | grep -q '^ok$' || \
+curl --fail --silent http://127.0.0.1:18181/healthz | grep -q '^ok$' || \
   fail "Xenon health check timed out"
 
 systemctl enable --now xenon-agent.service
@@ -158,7 +165,7 @@ port_in_use 10085 || \
   fail "embedded Xray API did not become ready; inspect journalctl -u xenon-agent"
 
 printf 'Xenon local test installation completed.\n'
-printf 'Health: http://127.0.0.1:18081/healthz\n'
+printf 'Health: http://127.0.0.1:18181/healthz\n'
 printf 'Logs: journalctl -u xenon -u xenon-agent -f\n'
 printf 'TUI: systemctl stop xenon && sudo -u xenon XENON_CONFIG=/etc/xenon/xenon.toml /usr/local/bin/xenon\n'
 printf 'Restart headless mode after leaving TUI: systemctl start xenon\n'

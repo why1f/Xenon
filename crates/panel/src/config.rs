@@ -258,7 +258,7 @@ fn default_grpc_addr() -> String {
     "127.0.0.1:50051".into()
 }
 fn default_http_addr() -> String {
-    "127.0.0.1:18081".into()
+    "127.0.0.1:18181".into()
 }
 fn default_database_path() -> String {
     "data/xenon.db".into()
@@ -525,7 +525,7 @@ mod tests {
         let mut config = PanelConfig::default();
         assert_eq!(
             config.subscription_http.public_base_url(&config.http_addr),
-            "http://127.0.0.1:18081"
+            "http://127.0.0.1:18181"
         );
         config.subscription_http.public_base_url = "https://sub.example.com/base/".into();
         assert_eq!(

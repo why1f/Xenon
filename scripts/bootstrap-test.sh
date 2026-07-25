@@ -29,7 +29,7 @@ case "$(uname -m)" in
 esac
 
 repository="${XENON_REPOSITORY:-why1f/Xenon}"
-version="${XENON_VERSION:-v0.1.0-alpha.4}"
+version="${XENON_VERSION:-v0.1.0-alpha.5}"
 artifact="xenon-linux-${architecture}"
 archive="${artifact}.tar.gz"
 checksum="${archive}.sha256"

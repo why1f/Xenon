@@ -50,10 +50,10 @@ Copy-Item agent.toml.example agent.toml
 cargo run -p xenon-agent
 ```
 
-Panel TUI 中：`c` 创建用户与订阅，`n` 创建节点并生成一次性 Agent 安装命令；Dashboard 使用 `Up/Down` 选择用户、`Enter` 查看订阅和各节点明细，大写 `N` 打开节点管理。节点页支持 `e` 或 `Enter` 编辑、`d` 启用或禁用、`u` 显示升级/回滚命令、`r` 吊销 Agent 证书、大写 `D` 确认逻辑删除、`n` 新建节点。用户详情页使用 `e` 编辑所选订阅的节点、额度、倍率、周期、到期时间和状态，`T` 轮换订阅 Token，`U` 轮换 Xray UUID，使用 `b` 或 `Enter` 管理网卡绑定，大写 `R` 立即重置订阅周期；网卡页支持 `a` 新增、`R` 重置、`D` 确认解绑。`q` 或 `Esc` 退出。健康检查：
+Panel TUI 顶部使用 `Tab` 或数字键 `1`/`2` 在总览和节点页间切换。总览页以真实节点数据展示 CPU、内存和磁盘仪表，并按 Xray 当前周期计费流量排列用户；`Up/Down` 选择用户、`Enter` 查看订阅和各节点明细，`c` 创建用户与订阅，`n` 创建节点并生成一次性 Agent 安装命令。节点页支持 `e` 或 `Enter` 编辑、`d` 启用或禁用、`u` 显示升级/回滚命令、`r` 吊销 Agent 证书、大写 `D` 确认逻辑删除、`n` 新建节点。用户详情页使用 `e` 编辑所选订阅的节点、额度、倍率、周期、到期时间和状态，`T` 轮换订阅 Token，`U` 轮换 Xray UUID，使用 `b` 或 `Enter` 管理网卡绑定，大写 `R` 立即重置订阅周期；网卡页支持 `a` 新增、`R` 重置、`D` 确认解绑。`q` 或 `Esc` 退出。健康检查：
 
 ```text
-GET http://127.0.0.1:18081/healthz
+GET http://127.0.0.1:18181/healthz
 ```
 
 订阅只读路由：
@@ -160,11 +160,11 @@ xenon-linux-aarch64.tar.gz.sha256
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh | sudo bash
 ```
 
-引导脚本默认下载 `v0.1.0-alpha.4`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
+引导脚本默认下载 `v0.1.0-alpha.5`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh \
-  | sudo XENON_VERSION=v0.1.0-alpha.4 bash
+  | sudo XENON_VERSION=v0.1.0-alpha.5 bash
 ```
 
 也可以从 [GitHub Releases](https://github.com/why1f/Xenon/releases) 手动下载对应架构的压缩包；包内 `scripts/install-test.sh` 可同时安装 Xenon 和 Agent：
@@ -176,10 +176,10 @@ cd xenon-linux-<arch>
 sudo ./scripts/install-test.sh
 ```
 
-该脚本仅创建回环测试环境：控制端口、订阅端口和 Xray 入站均只监听 `127.0.0.1`，使用 `development-only` 注册口令且不启用 TLS，不能用于生产或公网监听。安装后检查：
+该脚本仅创建回环测试环境：控制端口、订阅端口和 Xray 入站均只监听 `127.0.0.1`，使用 `development-only` 注册口令且不启用 TLS，不能用于生产或公网监听。旧测试配置中的订阅端口 `18081` 会自动迁移到 `18181`。安装后检查：
 
 ```bash
-curl http://127.0.0.1:18081/healthz
+curl http://127.0.0.1:18181/healthz
 sudo systemctl status xenon xenon-agent
 sudo journalctl -u xenon -u xenon-agent -f
 ```

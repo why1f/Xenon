@@ -6,7 +6,7 @@
 
 Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管理节点、用户和订阅，Agent 在 Linux 上以内嵌 Xray-core `26.6.27` 提供节点能力。主控不保存 SSH 密码，中转只保存客户端发布地址和端口，不负责中转服务器转发配置。
 
-当前版本为 `0.1.0-alpha.4`。它已经具备完整纵向功能和 Windows 开发环境自动测试，但尚未完成真实 Linux 生产环境的全部验收，因此当前结论是：
+当前版本为 `0.1.0-alpha.5`。它已经具备完整纵向功能和 Windows 开发环境自动测试，但尚未完成真实 Linux 生产环境的全部验收，因此当前结论是：
 
 - 可以用于本地体验、功能联调和隔离测试环境。
 - 可以在自有 Linux 测试 VPS 上进行试运行。
@@ -18,6 +18,7 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 
 - SQLite 单文件数据库、WAL、迁移、计费周期和流量聚合。
 - TUI 创建用户与订阅、选择多个节点、额度、到期、重置周期和单双倍计费。
+- TUI 总览和节点页提供统一页签、固定状态栏、真实资源仪表、用户流量排行和结构化节点清单。
 - 用户首页按 Xray 当前周期计费流量排序，详情显示订阅和节点流量。
 - 网卡绑定独立于用户 Xray 统计，只切换 `subscription-userinfo` 的计费来源。
 - 节点创建、编辑、启停、证书吊销、逻辑删除和 Agent 安装/升级命令。
@@ -38,15 +39,16 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 
 ### 当前自动验证
 
-- Workspace 37 项测试通过。
+- Workspace 38 项测试通过。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过。
 - TUI 所有主要页面通过 `24x4` 小终端无终端渲染测试。
+- TUI 总览和节点页通过带真实模型数据的 `120x36` 内容与选中状态测试。
 - Windows 开发 Panel 健康检查可用。
 
 ## 3. 尚未完成的生产准入项
 
-以下项目完成前，不应把 `0.1.0-alpha.4` 标为 production-ready：
+以下项目完成前，不应把 `0.1.0-alpha.5` 标为 production-ready：
 
 1. 在目标 Linux 发行版执行 `scripts/linux-e2e.sh`，验证真实 Xray、memfd、崩溃重启、父进程回收和网卡计数器。
 2. 使用 systemd 安装脚本进行安装、重启、升级失败自动回滚和人工回滚演练。
@@ -71,7 +73,7 @@ cargo build -p xenon
 
 ```powershell
 .\target\debug\xenon.exe --headless
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18081/healthz
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18181/healthz
 ```
 
 Windows 开发构建不会嵌入或运行 Xray，只用于 Panel、数据库、订阅和 TUI 开发。

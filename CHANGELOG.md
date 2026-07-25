@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.5 - 2026-07-26
+
+### Changed
+
+- Redesign the Dashboard and Nodes TUI around a shared tab bar, fixed status line, green structural borders, resource gauges, structured tables, and visible row selection.
+- Show real aggregate CPU, memory, disk, Xray user usage, Agent state, and published node endpoints without synthesizing traffic history.
+- Apply consistent field colors and active-row highlighting to subscription, node, and NIC forms.
+- Move the loopback test subscription and health endpoint from port `18081` to `18181`; the test installer migrates its exact generated legacy address while preserving custom addresses.
+
+### Tests
+
+- Verify the redesigned pages with populated `120x36` terminal buffers and retain the all-pages `24x4` no-panic coverage.
+
 ## 0.1.0-alpha.4 - 2026-07-26
 
 ### Fixed

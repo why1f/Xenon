@@ -8,9 +8,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Tabs, Wrap},
     Terminal,
 };
 use std::{io, sync::Arc, time::Duration};
@@ -1092,7 +1093,10 @@ fn run_blocking(
         }
         selected_node = selected_node.min(snapshot.nodes.len().saturating_sub(1));
         terminal.draw(|frame| match page {
-            Page::Dashboard => draw_dashboard(frame, &snapshot, selected_user),
+            Page::Dashboard => {
+                let area = draw_primary_shell(frame, &snapshot, 0);
+                draw_dashboard(frame, area, &snapshot, selected_user);
+            }
             Page::Create => draw_create(frame, &snapshot, &form),
             Page::NodeCreate => draw_node_create(frame, &node_form),
             Page::Revoke => draw_revoke(frame, &snapshot, &revoke_node_id),
@@ -1113,7 +1117,10 @@ fn run_blocking(
                 selected_subscription,
                 rotate_kind,
             ),
-            Page::Nodes => draw_nodes(frame, &snapshot, selected_node),
+            Page::Nodes => {
+                let area = draw_primary_shell(frame, &snapshot, 1);
+                draw_nodes(frame, area, &snapshot, selected_node);
+            }
             Page::NodeEdit => draw_node_edit(frame, &node_form, &edit_node_id),
             Page::NodeDeleteConfirm => draw_node_delete_confirm(frame, &snapshot, &delete_node_id),
         })?;
@@ -1125,6 +1132,10 @@ fn run_blocking(
                 match page {
                     Page::Dashboard => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Tab | KeyCode::Char('2') => {
+                            selected_node = 0;
+                            page = Page::Nodes;
+                        }
                         KeyCode::Char('c') => {
                             form = FormState::from_snapshot(&snapshot);
                             page = Page::Create;
@@ -1485,7 +1496,9 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::Nodes => match key.code {
-                        KeyCode::Esc | KeyCode::Left => page = Page::Dashboard,
+                        KeyCode::Esc | KeyCode::Left | KeyCode::Tab | KeyCode::Char('1') => {
+                            page = Page::Dashboard
+                        }
                         KeyCode::Up => selected_node = selected_node.saturating_sub(1),
                         KeyCode::Down if !snapshot.nodes.is_empty() => {
                             selected_node = (selected_node + 1).min(snapshot.nodes.len() - 1);
@@ -1593,152 +1606,531 @@ fn run_blocking(
     result
 }
 
-fn draw_dashboard(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, selected_user: usize) {
+fn draw_primary_shell(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    selected_tab: usize,
+) -> Rect {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let header = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(18), Constraint::Length(34)])
+        .split(areas[0]);
+    let tabs = Tabs::new(vec!["总览 [1]", "节点 [2]"])
+        .select(selected_tab)
+        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Green)),
+        );
+    frame.render_widget(tabs, header[0]);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Xenon {}  Agent {}/{}",
+            env!("CARGO_PKG_VERSION"),
+            snapshot.connected_agents,
+            snapshot.nodes.len()
+        ))
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Green)),
+        ),
+        header[1],
+    );
+
+    let (footer, footer_style) = if snapshot.notice.is_empty() {
+        let keys = if selected_tab == 0 {
+            "[Tab] 切换  [↑↓] 用户  [Enter] 详情  [c] 新建订阅  [n] 新建节点  [q] 退出"
+        } else {
+            "[Tab] 切换  [↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建"
+        };
+        (keys, Style::default().fg(Color::DarkGray))
+    } else {
+        (
+            snapshot.notice.as_str(),
+            Style::default().fg(notice_color(&snapshot.notice)),
+        )
+    };
+    frame.render_widget(Paragraph::new(footer).style(footer_style), areas[2]);
+    areas[1]
+}
+
+fn draw_dashboard(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    selected_user: usize,
+) {
+    if area.width < 48 || area.height < 12 {
+        let text = format!(
+            "Panel: active  Agents: {}  Users: {}  Nodes: {}",
+            snapshot.connected_agents,
+            snapshot.users.len(),
+            snapshot.nodes.len()
+        );
+        frame.render_widget(Paragraph::new(text).block(panel_block("Xenon 状态")), area);
+        return;
+    }
+
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(6),
+            Constraint::Length(8),
         ])
-        .split(frame.area());
+        .split(area);
+    let online_nodes = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.node_status == "online")
+        .count();
     frame.render_widget(
-        Paragraph::new("Xenon | Dashboard")
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("Panel")),
+        Paragraph::new(Line::from(vec![
+            Span::styled("● Panel ", Style::default().fg(Color::Green)),
+            Span::styled("运行中", Style::default().fg(Color::Green)),
+            Span::raw("    Agent "),
+            Span::styled(
+                snapshot.connected_agents.to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("    在线节点 "),
+            Span::styled(online_nodes.to_string(), Style::default().fg(Color::Cyan)),
+            Span::raw("    最近事件 "),
+            Span::styled(
+                truncate(snapshot.last_agent_event.as_deref().unwrap_or("-"), 54),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+        .block(panel_block("Xenon 状态")),
         areas[0],
     );
-    let mut body = format!(
-        "Agents online: {}\nLast event: {}\n\nUsers (charged Xray bytes, descending)\n",
-        snapshot.connected_agents,
-        snapshot.last_agent_event.as_deref().unwrap_or("-")
+
+    let metrics = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(areas[1]);
+    let cpu_values = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node.cpu_usage_basis_points)
+        .collect::<Vec<_>>();
+    let cpu = if cpu_values.is_empty() {
+        None
+    } else {
+        Some(cpu_values.iter().sum::<i64>() / cpu_values.len() as i64)
+    };
+    draw_metric_gauge(
+        frame,
+        metrics[0],
+        "平均 CPU",
+        cpu.unwrap_or_default(),
+        10_000,
+        cpu.map_or_else(
+            || "暂无数据".into(),
+            |value| format!("{:.1}%", value as f64 / 100.0),
+        ),
     );
-    if snapshot.users.is_empty() {
-        body.push_str("  - no users\n");
-    } else {
-        for (index, user) in snapshot.users.iter().take(12).enumerate() {
-            body.push_str(&format!(
-                "{} {:<20} {:>12}  subscriptions={}  status={}\n",
-                if index == selected_user { ">" } else { " " },
-                truncate(&user.username, 20),
-                format_bytes(user.charged_bytes),
-                user.subscription_count,
-                user.status
-            ));
-        }
+    let (memory_used, memory_total) = aggregate_resource(snapshot, ResourceKind::Memory);
+    draw_metric_gauge(
+        frame,
+        metrics[1],
+        "内存",
+        memory_used,
+        memory_total,
+        resource_label(memory_used, memory_total),
+    );
+    let (disk_used, disk_total) = aggregate_resource(snapshot, ResourceKind::Disk);
+    draw_metric_gauge(
+        frame,
+        metrics[2],
+        "磁盘",
+        disk_used,
+        disk_total,
+        resource_label(disk_used, disk_total),
+    );
+
+    let max_usage = snapshot
+        .users
+        .iter()
+        .map(|user| user.charged_bytes)
+        .max()
+        .unwrap_or_default();
+    let user_rows = snapshot.users.iter().enumerate().map(|(index, user)| {
+        Row::new(vec![
+            Cell::from(user.username.clone()),
+            Cell::from(user.status.clone()).style(Style::default().fg(status_color(&user.status))),
+            Cell::from(user.subscription_count.to_string()),
+            Cell::from(format_bytes(user.charged_bytes)),
+            Cell::from(usage_bar(user.charged_bytes, max_usage, 18)),
+        ])
+        .style(selected_style(index == selected_user))
+    });
+    let users_title = format!("用户流量排行 · {}", snapshot.users.len());
+    let users = Table::new(
+        user_rows,
+        [
+            Constraint::Percentage(25),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(13),
+            Constraint::Min(12),
+        ],
+    )
+    .header(table_header([
+        "用户",
+        "状态",
+        "订阅",
+        "Xray 计费",
+        "相对用量",
+    ]))
+    .column_spacing(1)
+    .block(panel_block(&users_title));
+    frame.render_widget(users, areas[2]);
+
+    let node_rows = snapshot.nodes.iter().take(5).map(|node| {
+        Row::new(vec![
+            Cell::from(node.name.clone()),
+            Cell::from(node.node_status.clone())
+                .style(Style::default().fg(status_color(&node.node_status))),
+            Cell::from(node.agent_status.clone().unwrap_or_else(|| "未注册".into())),
+            Cell::from(format_cpu(node.cpu_usage_basis_points)),
+            Cell::from(resource_label(
+                node.memory_used_bytes.unwrap_or_default(),
+                node.memory_total_bytes.unwrap_or_default(),
+            )),
+            Cell::from(published_endpoint(node)),
+        ])
+    });
+    let nodes_title = format!("节点摘要 · {}", snapshot.nodes.len());
+    let nodes = Table::new(
+        node_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Length(19),
+            Constraint::Min(16),
+        ],
+    )
+    .header(table_header([
+        "节点",
+        "运行状态",
+        "Agent",
+        "CPU",
+        "内存",
+        "发布地址",
+    ]))
+    .column_spacing(1)
+    .block(panel_block(&nodes_title));
+    frame.render_widget(nodes, areas[3]);
+}
+
+fn draw_nodes(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    selected_node: usize,
+) {
+    if area.width < 48 || area.height < 10 {
+        frame.render_widget(
+            Paragraph::new(format!("节点总数: {}", snapshot.nodes.len()))
+                .block(panel_block("节点管理")),
+            area,
+        );
+        return;
     }
-    body.push_str("\nNodes\n");
-    if snapshot.nodes.is_empty() {
-        body.push_str("  - no nodes\n");
-    } else {
-        for node in snapshot.nodes.iter().take(12) {
-            let cpu = node
-                .cpu_usage_basis_points
-                .map(|value| format!("{:.1}%", value as f64 / 100.0))
-                .unwrap_or_else(|| "-".into());
-            let memory = match (node.memory_used_bytes, node.memory_total_bytes) {
-                (Some(used), Some(total)) if total > 0 => {
-                    format!("{}/{}", format_bytes(used), format_bytes(total))
-                }
-                _ => "-".into(),
-            };
-            let disk = match (node.disk_used_bytes, node.disk_total_bytes) {
-                (Some(used), Some(total)) if total > 0 => {
-                    format!("{}/{}", format_bytes(used), format_bytes(total))
-                }
-                _ => "-".into(),
-            };
-            let load = node
-                .load_1_milli
-                .map(|value| format!("{:.2}", value as f64 / 1000.0))
-                .unwrap_or_else(|| "-".into());
-            body.push_str(&format!(
-                "  {:<18} {}:{}  {}  cpu={} mem={} disk={} load={} status={}/{} agent={}/{} xray={}\n",
-                truncate(&node.name, 18),
+
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(7),
+            Constraint::Length(7),
+        ])
+        .split(area);
+    let metrics = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(areas[0]);
+    let enabled = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.management_status == "active")
+        .count();
+    let online = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.node_status == "online")
+        .count();
+    draw_count_metric(
+        frame,
+        metrics[0],
+        "节点",
+        snapshot.nodes.len(),
+        format!("启用 {enabled}  在线 {online}"),
+    );
+    let (memory_used, memory_total) = aggregate_resource(snapshot, ResourceKind::Memory);
+    draw_metric_gauge(
+        frame,
+        metrics[1],
+        "节点总内存",
+        memory_used,
+        memory_total,
+        resource_label(memory_used, memory_total),
+    );
+    let (disk_used, disk_total) = aggregate_resource(snapshot, ResourceKind::Disk);
+    draw_metric_gauge(
+        frame,
+        metrics[2],
+        "节点总磁盘",
+        disk_used,
+        disk_total,
+        resource_label(disk_used, disk_total),
+    );
+
+    let rows = snapshot.nodes.iter().enumerate().map(|(index, node)| {
+        Row::new(vec![
+            Cell::from(node.name.clone()),
+            Cell::from(node.management_status.clone())
+                .style(Style::default().fg(status_color(&node.management_status))),
+            Cell::from(node.node_status.clone())
+                .style(Style::default().fg(status_color(&node.node_status))),
+            Cell::from(node.agent_status.clone().unwrap_or_else(|| "未注册".into())),
+            Cell::from(published_endpoint(node)),
+            Cell::from(format_cpu(node.cpu_usage_basis_points)),
+            Cell::from(resource_percent(
+                node.memory_used_bytes,
+                node.memory_total_bytes,
+            )),
+        ])
+        .style(selected_style(index == selected_node))
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(18),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Min(18),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(table_header([
+        "节点",
+        "管理",
+        "运行",
+        "Agent",
+        "发布地址",
+        "CPU",
+        "内存",
+    ]))
+    .column_spacing(1)
+    .block(panel_block("节点清单"));
+    frame.render_widget(table, areas[1]);
+
+    let detail = snapshot.nodes.get(selected_node).map_or_else(
+        || "尚未创建节点".to_string(),
+        |node| {
+            format!(
+                "ID: {}\n版本: Agent {}  Xray {}  配置修订 {}\n负载: {}  磁盘: {}  安全: {}\n落地: {}:{}",
+                node.id,
+                node.agent_version.as_deref().unwrap_or("-"),
+                node.xray_version.as_deref().unwrap_or("-"),
+                node.desired_revision,
+                node.load_1_milli.map_or_else(|| "-".into(), |value| format!("{:.2}", value as f64 / 1000.0)),
+                resource_label(node.disk_used_bytes.unwrap_or_default(), node.disk_total_bytes.unwrap_or_default()),
+                node.security,
                 node.landing_host,
                 node.xray_listen_port,
-                node.security,
-                cpu,
-                memory,
-                disk,
-                load,
-                node.management_status,
-                node.node_status,
-                node.agent_status.as_deref().unwrap_or("unregistered"),
-                node.agent_version.as_deref().unwrap_or("-"),
-                node.xray_version.as_deref().unwrap_or("-")
-            ));
-        }
-    }
-    if !snapshot.notice.is_empty() {
-        body.push_str(&format!("\n{}\n", snapshot.notice));
-    }
-    frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Overview")),
-        areas[1],
+            )
+        },
     );
     frame.render_widget(
-        Paragraph::new(
-            "Up/Down User   Enter Details   c Create   n New node   N Nodes   r Revoke   q Quit",
-        )
-        .style(Style::default().fg(Color::Green))
-        .block(Block::default().borders(Borders::ALL).title("Keys")),
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: true })
+            .block(panel_block("选中节点")),
         areas[2],
     );
 }
 
-fn draw_nodes(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, selected_node: usize) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
+#[derive(Clone, Copy)]
+enum ResourceKind {
+    Memory,
+    Disk,
+}
+
+fn aggregate_resource(snapshot: &TuiSnapshot, kind: ResourceKind) -> (i64, i64) {
+    snapshot.nodes.iter().fold((0_i64, 0_i64), |totals, node| {
+        let values = match kind {
+            ResourceKind::Memory => (node.memory_used_bytes, node.memory_total_bytes),
+            ResourceKind::Disk => (node.disk_used_bytes, node.disk_total_bytes),
+        };
+        match values {
+            (Some(used), Some(total)) if total > 0 => (
+                totals.0.saturating_add(used.max(0)),
+                totals.1.saturating_add(total),
+            ),
+            _ => totals,
+        }
+    })
+}
+
+fn panel_block<'a>(title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(title, Style::default().fg(Color::Green)))
+}
+
+fn table_header<const N: usize>(labels: [&str; N]) -> Row<'static> {
+    Row::new(labels.map(|label| Cell::from(label.to_string()))).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn selected_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "active" | "online" | "running" | "ready" | "connected" => Color::Green,
+        "disabled" | "offline" | "failed" | "revoked" => Color::Red,
+        _ => Color::Yellow,
+    }
+}
+
+fn notice_color(notice: &str) -> Color {
+    let lower = notice.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") || lower.contains("cannot") {
+        Color::Red
+    } else {
+        Color::Yellow
+    }
+}
+
+fn draw_metric_gauge(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    used: i64,
+    total: i64,
+    label: String,
+) {
+    let ratio = if total > 0 {
+        used.max(0).min(total) as f64 / total as f64
+    } else {
+        0.0
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(panel_block(title))
+            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
+            .ratio(ratio)
+            .label(label),
+        area,
+    );
+}
+
+fn draw_count_metric(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    count: usize,
+    detail: String,
+) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                count.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
         ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new("Node management")
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("Nodes")),
-        areas[0],
+        .alignment(Alignment::Center)
+        .block(panel_block(title)),
+        area,
     );
-    let mut body = String::new();
-    for (index, node) in snapshot.nodes.iter().enumerate() {
-        body.push_str(&format!(
-            "{} {:<18} {:<9} runtime={:<8} agent={:<12} {}:{}\n",
-            if index == selected_node { ">" } else { " " },
-            truncate(&node.name, 18),
-            node.management_status,
-            node.node_status,
-            node.agent_status.as_deref().unwrap_or("unregistered"),
-            node.publish_host.as_deref().unwrap_or(&node.landing_host),
-            node.publish_port.unwrap_or(node.xray_listen_port),
-        ));
-        body.push_str(&format!(
-            "    id={} security={} revision={} agent-version={} xray={}\n",
-            node.id,
-            node.security,
-            node.desired_revision,
-            node.agent_version.as_deref().unwrap_or("-"),
-            node.xray_version.as_deref().unwrap_or("-"),
-        ));
+}
+
+fn resource_label(used: i64, total: i64) -> String {
+    if total > 0 {
+        format!("{} / {}", format_bytes(used), format_bytes(total))
+    } else {
+        "暂无数据".into()
     }
-    if snapshot.nodes.is_empty() {
-        body.push_str("No nodes\n");
+}
+
+fn resource_percent(used: Option<i64>, total: Option<i64>) -> String {
+    match (used, total) {
+        (Some(used), Some(total)) if total > 0 => {
+            format!("{:.1}%", used.max(0) as f64 / total as f64 * 100.0)
+        }
+        _ => "-".into(),
     }
-    if !snapshot.notice.is_empty() {
-        body.push_str(&format!("\n{}\n", snapshot.notice));
+}
+
+fn format_cpu(value: Option<i64>) -> String {
+    value.map_or_else(
+        || "-".into(),
+        |value| format!("{:.1}%", value as f64 / 100.0),
+    )
+}
+
+fn published_endpoint(node: &models::NodeOverview) -> String {
+    format!(
+        "{}:{}",
+        node.publish_host.as_deref().unwrap_or(&node.landing_host),
+        node.publish_port.unwrap_or(node.xray_listen_port)
+    )
+}
+
+fn usage_bar(value: i64, max: i64, width: usize) -> String {
+    let filled = if max > 0 {
+        ((value.max(0) as u128 * width as u128) / max as u128) as usize
+    } else {
+        0
     }
-    frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Inventory")),
-        areas[1],
-    );
-    frame.render_widget(
-        Paragraph::new("Up/Down Select   Enter/e Edit   d Enable/disable   u Upgrade   r Revoke   D Delete   n New   Esc Back")
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
-        areas[2],
-    );
+    .min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 fn draw_node_edit(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, node_id: &str) {
@@ -2007,24 +2399,19 @@ fn draw_nic_create(
         "Direction (rx_tx, tx_only, rx_only)",
         "Reset policy",
     ];
-    let mut body = String::new();
-    for (index, (label, value)) in labels.iter().zip(form.fields.iter()).enumerate() {
-        body.push_str(&format!(
-            "{} {label}: {value}\n",
-            if index == form.active { ">" } else { " " }
-        ));
-    }
-    body.push_str("\nReported interfaces:\n");
+    let mut body = form_lines(&labels, &form.fields, form.active);
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        "Reported interfaces:",
+        Style::default().fg(Color::Yellow),
+    )));
     for interface in snapshot.interfaces.iter().take(10) {
-        body.push_str(&format!(
-            "  {}/{}\n",
+        body.push(Line::from(format!(
+            "  {}/{}",
             interface.node_id, interface.interface_name
-        ));
+        )));
     }
-    frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Fields")),
-        areas[1],
-    );
+    frame.render_widget(Paragraph::new(body).block(panel_block("Fields")), areas[1]);
     frame.render_widget(
         Paragraph::new("Tab/Up/Down Move   Enter Add   Esc Cancel")
             .style(Style::default().fg(Color::Green))
@@ -2080,15 +2467,8 @@ fn draw_subscription_edit(frame: &mut ratatui::Frame<'_>, form: &SubscriptionEdi
         "Reset (never, manual, daily:HH:MM, monthly:DAY@HH:MM, interval:DAYS)",
         "Status (active or disabled)",
     ];
-    let mut body = String::new();
-    for (index, (label, value)) in labels.iter().zip(form.fields.iter()).enumerate() {
-        body.push_str(&format!(
-            "{} {label}: {value}\n",
-            if index == form.active { ">" } else { " " }
-        ));
-    }
     frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Fields")),
+        Paragraph::new(form_lines(&labels, &form.fields, form.active)).block(panel_block("Fields")),
         areas[1],
     );
     frame.render_widget(
@@ -2160,31 +2540,32 @@ fn draw_create(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, form: &Fo
         "Reset (never, manual, daily:HH:MM, monthly:DAY@HH:MM, interval:DAYS)",
         "NIC node/interface/limit/initial[/direction[/reset]] (; separated)",
     ];
-    let mut body = String::new();
-    for (index, (label, value)) in labels.iter().zip(form.fields.iter()).enumerate() {
-        let marker = if index == form.active { ">" } else { " " };
-        body.push_str(&format!("{marker} {label}: {value}\n"));
-    }
-    body.push_str("\nAvailable nodes:\n");
+    let mut body = form_lines(&labels, &form.fields, form.active);
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        "Available nodes:",
+        Style::default().fg(Color::Yellow),
+    )));
     for node in snapshot
         .nodes
         .iter()
         .filter(|node| node.management_status == "active")
         .take(8)
     {
-        body.push_str(&format!("  {} ({})\n", node.id, node.name));
+        body.push(Line::from(format!("  {} ({})", node.id, node.name)));
     }
-    body.push_str("\nReported interfaces:\n");
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        "Reported interfaces:",
+        Style::default().fg(Color::Yellow),
+    )));
     for interface in snapshot.interfaces.iter().take(8) {
-        body.push_str(&format!(
-            "  {}/{}\n",
+        body.push(Line::from(format!(
+            "  {}/{}",
             interface.node_id, interface.interface_name
-        ));
+        )));
     }
-    frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Fields")),
-        areas[1],
-    );
+    frame.render_widget(Paragraph::new(body).block(panel_block("Fields")), areas[1]);
     frame.render_widget(
         Paragraph::new("Tab/Up/Down Move   Enter Create   Esc Cancel")
             .style(Style::default().fg(Color::Green))
@@ -2229,13 +2610,8 @@ fn draw_node_form(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, title: &
         "Reality short ID",
         "Reality fingerprint",
     ];
-    let mut body = String::new();
-    for (index, (label, value)) in labels.iter().zip(form.fields.iter()).enumerate() {
-        let marker = if index == form.active { ">" } else { " " };
-        body.push_str(&format!("{marker} {label}: {value}\n"));
-    }
     frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Fields")),
+        Paragraph::new(form_lines(&labels, &form.fields, form.active)).block(panel_block("Fields")),
         areas[1],
     );
     frame.render_widget(
@@ -2244,6 +2620,27 @@ fn draw_node_form(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, title: &
             .block(Block::default().borders(Borders::ALL).title("Keys")),
         areas[2],
     );
+}
+
+fn form_lines(labels: &[&str], values: &[String], active: usize) -> Vec<Line<'static>> {
+    labels
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(index, (label, value))| {
+            if index == active {
+                Line::from(format!("> {label}: {value}"))
+                    .style(Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Line::from(vec![
+                    Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(label.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::styled(": ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(value.clone(), Style::default().fg(Color::White)),
+                ])
+            }
+        })
+        .collect()
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -2294,8 +2691,8 @@ mod tests {
         CreateNodeInput, CreateSubscriptionInput, FormState, NicBindingFormState, NodeFormState,
         SubscriptionEditFormState, TuiSnapshot,
     };
-    use ratatui::{backend::TestBackend, Terminal};
-    use xenon_storage::Database;
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use xenon_storage::{models, Database};
 
     #[test]
     fn renders_every_page_in_a_small_terminal_without_panicking() {
@@ -2316,8 +2713,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
         terminal
             .draw(|frame| {
-                super::draw_dashboard(frame, &snapshot, 0);
-                super::draw_nodes(frame, &snapshot, 0);
+                let dashboard = super::draw_primary_shell(frame, &snapshot, 0);
+                super::draw_dashboard(frame, dashboard, &snapshot, 0);
+                let nodes = super::draw_primary_shell(frame, &snapshot, 1);
+                super::draw_nodes(frame, nodes, &snapshot, 0);
                 super::draw_node_edit(frame, &node_form, "node");
                 super::draw_node_delete_confirm(frame, &snapshot, "node");
                 super::draw_revoke(frame, &snapshot, "node");
@@ -2338,6 +2737,96 @@ mod tests {
             .expect("small terminal render");
     }
 
+    #[test]
+    fn dashboard_and_nodes_render_structured_operational_data() {
+        let snapshot = TuiSnapshot {
+            connected_agents: 1,
+            last_agent_event: Some("node-a connected".into()),
+            users: vec![models::UserSummary {
+                id: "user-a".into(),
+                username: "admin".into(),
+                display_name: None,
+                status: "active".into(),
+                subscription_count: 2,
+                charged_bytes: 8 * 1024 * 1024,
+            }],
+            nodes: vec![models::NodeOverview {
+                id: "node-a".into(),
+                name: "Tokyo".into(),
+                landing_host: "203.0.113.10".into(),
+                xray_listen_port: 443,
+                publish_host: Some("relay.example".into()),
+                publish_port: Some(8443),
+                protocol: "vless".into(),
+                transport: "tcp".into(),
+                security: "reality".into(),
+                server_name: Some("example.com".into()),
+                reality_public_key: Some("public-key".into()),
+                reality_short_id: Some("short-id".into()),
+                reality_fingerprint: Some("chrome".into()),
+                node_status: "online".into(),
+                management_status: "active".into(),
+                desired_revision: 3,
+                agent_status: Some("online".into()),
+                last_seen_at: Some(1),
+                agent_version: Some("0.1.0-alpha.5".into()),
+                xray_version: Some("26.6.27".into()),
+                cpu_usage_basis_points: Some(1250),
+                load_1_milli: Some(420),
+                memory_total_bytes: Some(1024 * 1024 * 1024),
+                memory_used_bytes: Some(512 * 1024 * 1024),
+                disk_total_bytes: Some(20 * 1024 * 1024 * 1024),
+                disk_used_bytes: Some(5 * 1024 * 1024 * 1024),
+            }],
+            ..TuiSnapshot::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = super::draw_primary_shell(frame, &snapshot, 0);
+                super::draw_dashboard(frame, area, &snapshot, 0);
+            })
+            .expect("dashboard render");
+        let dashboard = rendered_text(&terminal);
+        let compact_dashboard = dashboard.replace(' ', "");
+        assert!(compact_dashboard.contains("总览[1]"), "{dashboard}");
+        assert!(compact_dashboard.contains("平均CPU"), "{dashboard}");
+        assert!(compact_dashboard.contains("用户流量排行"), "{dashboard}");
+        assert!(dashboard.contains("admin"), "{dashboard}");
+        assert!(dashboard.contains("relay.example:8443"), "{dashboard}");
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Cyan));
+
+        let mut node_terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
+        node_terminal
+            .draw(|frame| {
+                let area = super::draw_primary_shell(frame, &snapshot, 1);
+                super::draw_nodes(frame, area, &snapshot, 0);
+            })
+            .expect("nodes render");
+        let nodes = rendered_text(&node_terminal);
+        let compact_nodes = nodes.replace(' ', "");
+        assert!(compact_nodes.contains("节点[2]"), "{nodes}");
+        assert!(compact_nodes.contains("节点清单"), "{nodes}");
+        assert!(compact_nodes.contains("选中节点"), "{nodes}");
+        assert!(nodes.contains("26.6.27"), "{nodes}");
+    }
+
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[tokio::test]
     async fn creates_user_and_subscription_from_wizard_input() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -2355,7 +2844,7 @@ mod tests {
 
         let notice = create_subscription(
             &database,
-            "http://127.0.0.1:18081",
+            "http://127.0.0.1:18181",
             CreateSubscriptionInput {
                 username: "alice".into(),
                 name: "Alice default".into(),
@@ -2370,7 +2859,7 @@ mod tests {
         .await
         .expect("create subscription");
 
-        assert!(notice.contains("http://127.0.0.1:18081/sub/"));
+        assert!(notice.contains("http://127.0.0.1:18181/sub/"));
         let users = database.list_user_summaries().await.expect("users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].username, "alice");

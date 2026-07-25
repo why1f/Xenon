@@ -1,6 +1,6 @@
 # Copy to xenon.toml before starting Xenon.
 grpc_addr = "127.0.0.1:50051"
-http_addr = "127.0.0.1:18081"
+http_addr = "127.0.0.1:18181"
 database_path = "data/xenon.db"
 
 [subscription_http]
