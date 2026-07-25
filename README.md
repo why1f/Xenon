@@ -154,7 +154,20 @@ xenon-linux-aarch64.tar.gz.sha256
 
 ### 单机一键测试安装
 
-release 压缩包内的 `scripts/install-test.sh` 可在一台使用 systemd 的 Linux 测试机上同时安装 Xenon 和 Agent：
+公开仓库可在 x86_64 或 ARM64、使用 systemd 的 Linux 测试机上匿名下载并安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh | sudo bash
+```
+
+引导脚本默认下载 `v0.1.0-alpha.2`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh \
+  | sudo XENON_VERSION=v0.1.0-alpha.2 bash
+```
+
+也可以从 [GitHub Releases](https://github.com/why1f/Xenon/releases) 手动下载对应架构的压缩包；包内 `scripts/install-test.sh` 可同时安装 Xenon 和 Agent：
 
 ```bash
 sha256sum -c xenon-linux-<arch>.tar.gz.sha256

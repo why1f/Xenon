@@ -105,9 +105,9 @@ Linux release 构建在缺少内核、版本不等于 `26.6.27` 或摘要不一�
 
 详细配置、按键和运维命令见 `README.md`，完整业务规则和验收标准见 `PROJECT_SPEC.md`。
 
-## 5. GitHub 发布建议
+## 5. GitHub 发布状态
 
-建议上传 GitHub，但第一阶段先使用私有仓库。真实 Linux 验收和安全检查完成后，再决定是否公开。
+源码仓库已公开在 <https://github.com/why1f/Xenon>。当前 Release 为测试预发布版；公开仓库不代表已经完成生产准入，正式部署前仍须完成下述 Linux 实机验收和安全检查。
 
 只提交源码、迁移、示例配置、脚本和文档。不得提交：
 
@@ -139,7 +139,7 @@ git push -u origin main
 ### P0：生产准入
 
 - 完成 Linux E2E、systemd、mTLS 和灾难恢复实机验收。
-- 将现有双架构 GitHub Actions 测试制品扩展为受控 release、制品签名和版本发布流程。
+- 为现有双架构 GitHub Pre-release 增加制品签名和稳定版发布流程。
 - 形成最小部署手册、证书轮换手册和故障回滚手册。
 
 ### P1：容量与稳定性
