@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.3 - 2026-07-26
+
+### Fixed
+
+- Build x86_64 and ARM64 release binaries for a minimum glibc 2.17 runtime instead of inheriting Ubuntu 24.04's glibc 2.39 requirement.
+- Reject release artifacts in CI when their required GLIBC symbol version exceeds 2.17.
+
 ## 0.1.0-alpha.2 - 2026-07-26
 
 ### Added

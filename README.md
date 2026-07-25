@@ -139,7 +139,7 @@ AGENT_PID=$(pidof xenon-agent) SAMPLE_SECONDS=30 ./scripts/resource-benchmark.sh
 
 ## GitHub Linux 构建
 
-`.github/workflows/linux-build.yml` 为 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu` 构建 release 制品。工作流在 `main` 的构建相关文件变化、`v*` 标签和手动触发时运行。它从 XTLS/Xray-core 固定标签 `v26.6.27` 下载架构对应的官方压缩包，先校验仓库中固定的压缩包 SHA-256，再把提取后内核的 SHA-256 交给 Agent 构建脚本验证。`v*` 标签构建只有在两个架构均成功后才自动创建 GitHub Pre-release，并附加两个压缩包及其 SHA-256 文件。
+`.github/workflows/linux-build.yml` 为 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu` 构建 release 制品。工作流使用 Zig 将最低运行时固定为 glibc 2.17，并扫描成品的 GLIBC 符号版本防止兼容性回退。它在 `main` 的构建相关文件变化、`v*` 标签和手动触发时运行，从 XTLS/Xray-core 固定标签 `v26.6.27` 下载架构对应的官方压缩包，先校验仓库中固定的压缩包 SHA-256，再把提取后内核的 SHA-256 交给 Agent 构建脚本验证。`v*` 标签构建只有在两个架构均成功后才自动创建 GitHub Pre-release，并附加两个压缩包及其 SHA-256 文件。
 
 每个架构上传一个保留 14 天的 GitHub Actions artifact：
 
@@ -160,11 +160,11 @@ xenon-linux-aarch64.tar.gz.sha256
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh | sudo bash
 ```
 
-引导脚本默认下载 `v0.1.0-alpha.2`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
+引导脚本默认下载 `v0.1.0-alpha.3`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh \
-  | sudo XENON_VERSION=v0.1.0-alpha.2 bash
+  | sudo XENON_VERSION=v0.1.0-alpha.3 bash
 ```
 
 也可以从 [GitHub Releases](https://github.com/why1f/Xenon/releases) 手动下载对应架构的压缩包；包内 `scripts/install-test.sh` 可同时安装 Xenon 和 Agent：

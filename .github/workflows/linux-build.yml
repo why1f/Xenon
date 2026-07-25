@@ -55,11 +55,13 @@ jobs:
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
 
-      - name: Install arm64 cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.23.0
 
       - name: Download and verify Xray-core
         env:
@@ -79,17 +81,30 @@ jobs:
           printf 'XRAY_BINARY_SHA256=%s\n' "$(sha256sum .ci-xray/xray | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: Build release binaries
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --locked --release --target "${{ matrix.target }}" -p xenon -p xenon-agent
+        run: cargo zigbuild --locked --release --target "${{ matrix.target }}.2.17" -p xenon -p xenon-agent
 
       - name: Inspect binaries
         run: |
           set -euo pipefail
-          file "target/${{ matrix.target }}/release/xenon"
-          file "target/${{ matrix.target }}/release/xenon-agent"
-          readelf -h "target/${{ matrix.target }}/release/xenon-agent"
+          for binary in xenon xenon-agent; do
+            path="target/${{ matrix.target }}/release/${binary}"
+            file "$path"
+            readelf -h "$path"
+            required_glibc="$({
+              readelf -W --version-info "$path" \
+                | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p'
+            } | sort -V | tail -n 1)"
+            [ -n "$required_glibc" ] || {
+              printf 'could not determine GLIBC requirement for %s\n' "$path" >&2
+              exit 1
+            }
+            printf '%s requires at most GLIBC_%s\n' "$binary" "$required_glibc"
+            [ "$(printf '%s\n' "$required_glibc" 2.17 | sort -V | tail -n 1)" = "2.17" ] || {
+              printf '%s requires GLIBC_%s, newer than allowed GLIBC_2.17\n' \
+                "$binary" "$required_glibc" >&2
+              exit 1
+            }
+          done
 
       - name: Verify embedded Xray metadata
         if: matrix.target == 'x86_64-unknown-linux-gnu'
