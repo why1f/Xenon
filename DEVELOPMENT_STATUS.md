@@ -54,7 +54,7 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 4. 执行 Panel 进程/主机重启、Agent 断线期间流量补报、数据库备份恢复灾难演练。
 5. 在真实 Xray API 下执行 100、500、1000 用户同步和采集压力测试，记录 RSS、CPU、延迟和丢批情况。
 6. 对订阅端点、安装脚本、证书权限和日志进行独立安全审查。
-7. 在现有 CI 基础上建立 Linux release 构建、制品摘要、版本发布和升级兼容流程。
+7. 在现有 CI 和双架构 Linux 构建基础上建立版本发布、制品签名和升级兼容流程。
 
 ## 4. 使用方式
 
@@ -139,7 +139,7 @@ git push -u origin main
 ### P0：生产准入
 
 - 完成 Linux E2E、systemd、mTLS 和灾难恢复实机验收。
-- 扩展 GitHub Actions：在现有格式、测试和 Clippy 检查上增加受控 Linux release 和制品摘要。
+- 将现有双架构 GitHub Actions 测试制品扩展为受控 release、制品签名和版本发布流程。
 - 形成最小部署手册、证书轮换手册和故障回滚手册。
 
 ### P1：容量与稳定性

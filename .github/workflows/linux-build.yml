@@ -1,0 +1,126 @@
+name: Linux builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/linux-build.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE"
+      - "README.md"
+      - "agent.toml.example"
+      - "crates/**"
+      - "migrations/**"
+      - "packaging/**"
+      - "proto/**"
+      - "scripts/install-agent.sh"
+      - "xenon.toml.example"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  XRAY_BINARY_VERSION: 26.6.27
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: xenon-linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            xray_asset: Xray-linux-64.zip
+            xray_archive_sha256: b3e5902d06d6282fe53cfa2fc426058b9aeaa429b2c812e20887cd47f26d08bf
+          - artifact: xenon-linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            xray_asset: Xray-linux-arm64-v8a.zip
+            xray_archive_sha256: 13a251379bea366c2cf10363ad71e75734193d401f26f518bf0c25e5c8f8c931
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install arm64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+
+      - name: Download and verify Xray-core
+        env:
+          XRAY_ASSET: ${{ matrix.xray_asset }}
+          XRAY_ARCHIVE_SHA256: ${{ matrix.xray_archive_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-xray
+          archive=".ci-xray/${XRAY_ASSET}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_BINARY_VERSION}/${XRAY_ASSET}" \
+            --output "$archive"
+          printf '%s  %s\n' "$XRAY_ARCHIVE_SHA256" "$archive" | sha256sum --check --strict
+          unzip -q "$archive" xray LICENSE -d .ci-xray
+          chmod 0755 .ci-xray/xray
+          printf 'XRAY_BINARY_PATH=%s/.ci-xray/xray\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          printf 'XRAY_BINARY_SHA256=%s\n' "$(sha256sum .ci-xray/xray | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Build release binaries
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p xenon -p xenon-agent
+
+      - name: Inspect binaries
+        run: |
+          set -euo pipefail
+          file "target/${{ matrix.target }}/release/xenon"
+          file "target/${{ matrix.target }}/release/xenon-agent"
+          readelf -h "target/${{ matrix.target }}/release/xenon-agent"
+
+      - name: Verify embedded Xray metadata
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          info="$(target/${{ matrix.target }}/release/xenon-agent version-info)"
+          printf '%s\n' "$info"
+          grep -Fxq 'embedded_xray_version=26.6.27' <<<"$info"
+          grep -Fxq 'embedded_xray_available=true' <<<"$info"
+          grep -Fxq "embedded_xray_sha256=${XRAY_BINARY_SHA256}" <<<"$info"
+
+      - name: Package artifact
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          root="dist/${ARTIFACT}"
+          install -d "$root/bin" "$root/examples" "$root/systemd" "$root/scripts"
+          install -m 0755 "target/${TARGET}/release/xenon" "$root/bin/xenon"
+          install -m 0755 "target/${TARGET}/release/xenon-agent" "$root/bin/xenon-agent"
+          install -m 0644 packaging/xenon.service "$root/systemd/xenon.service"
+          install -m 0644 packaging/xenon-agent.service "$root/systemd/xenon-agent.service"
+          install -m 0755 scripts/install-agent.sh "$root/scripts/install-agent.sh"
+          install -m 0644 xenon.toml.example "$root/examples/xenon.toml.example"
+          install -m 0644 agent.toml.example "$root/examples/agent.toml.example"
+          install -m 0644 LICENSE "$root/LICENSE"
+          install -m 0644 .ci-xray/LICENSE "$root/XRAY-LICENSE"
+          install -m 0644 README.md "$root/README.md"
+          tar -C dist -czf "dist/${ARTIFACT}.tar.gz" "$ARTIFACT"
+          (cd dist && sha256sum "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

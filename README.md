@@ -137,6 +137,21 @@ AGENT_PID=$(pidof xenon-agent) SAMPLE_SECONDS=30 ./scripts/resource-benchmark.sh
 
 该脚本输出 Agent 二进制体积、RSS/峰值 RSS、采样区间 CPU basis points 和 Xray 子进程 RSS。它不声称代表 1000 用户负载；批量用户性能必须在真实 Xray API、真实用户同步和流量查询下另做压力测试。
 
+## GitHub Linux 构建
+
+`.github/workflows/linux-build.yml` 为 `x86_64-unknown-linux-gnu` 和 `aarch64-unknown-linux-gnu` 构建 release 制品。工作流在 `main` 的构建相关文件变化、`v*` 标签和手动触发时运行。它从 XTLS/Xray-core 固定标签 `v26.6.27` 下载架构对应的官方压缩包，先校验仓库中固定的压缩包 SHA-256，再把提取后内核的 SHA-256 交给 Agent 构建脚本验证。
+
+每个架构上传一个保留 14 天的 GitHub Actions artifact：
+
+```text
+xenon-linux-x86_64.tar.gz
+xenon-linux-x86_64.tar.gz.sha256
+xenon-linux-aarch64.tar.gz
+xenon-linux-aarch64.tar.gz.sha256
+```
+
+压缩包包含 `xenon`、已嵌入对应架构 Xray 的 `xenon-agent`、systemd 单元、Agent 安装器、项目许可证和 Xray 许可证。Actions artifact 是测试制品；正式发布仍应创建版本标签、保留摘要并完成 Linux E2E 后再对外提供。
+
 将 `xenon.toml` 的 `[tls]` 文件路径指向 `dev-certs/server.crt`、`server.key`、`ca.crt`，将 `agent.toml` 的 `[tls]` 文件路径指向 `ca.crt`、`agent.crt`、`agent.key`，并将 Agent 的地址改为 `https://panel.internal:50051`。开发机需要将 `panel.internal` 解析到 Xenon 地址。证书脚本只用于本地测试，不能代替生产 CA、证书轮换和一次性注册 Token。
 
 ## 目录
