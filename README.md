@@ -204,7 +204,7 @@ curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh \
-  | sudo XENON_VERSION=v0.1.0-alpha.6 bash
+  | sudo XENON_VERSION=v0.1.0-alpha.11 bash
 ```
 
 也可以从 [GitHub Releases](https://github.com/why1f/Xenon/releases) 手动下载对应架构的压缩包；包内 `scripts/install-test.sh` 可同时安装 Xenon 和 Agent：

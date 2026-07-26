@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.11 - 2026-07-26
+
+### Fixed
+
+- Select the newest published GitHub Release by `published_at` in both one-line installers. GitHub's release-array order placed `alpha.10` behind `alpha.9`, while `/releases/latest` excludes prereleases entirely.
+
 ## 0.1.0-alpha.10 - 2026-07-26
 
 ### Changed
