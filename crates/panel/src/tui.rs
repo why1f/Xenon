@@ -11,10 +11,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
     Terminal,
 };
-use std::{io, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch, RwLock};
 use uuid::Uuid;
 use xenon_storage::{models, Database};
@@ -25,13 +25,26 @@ struct TuiSnapshot {
     last_agent_event: Option<String>,
     users: Vec<models::UserSummary>,
     nodes: Vec<models::NodeOverview>,
+    proxy_nodes: Vec<models::ProxyNodeRecord>,
     interfaces: Vec<models::InterfaceRecord>,
+    agent_events: Vec<String>,
     user_detail: Option<models::UserDetail>,
     notice: String,
     down_rate_bps: u64,
     up_rate_bps: u64,
     down_rate_history: Vec<u64>,
     up_rate_history: Vec<u64>,
+    host_nic: Vec<HostNicSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct HostNicSnapshot {
+    node_id: String,
+    rx_bytes: i64,
+    tx_bytes: i64,
+    down_rate_bps: u64,
+    up_rate_bps: u64,
+    sampled_at: i64,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +105,25 @@ impl NicRateTracker {
     }
 }
 
+fn apply_host_nic_rates(snapshot: &mut TuiSnapshot, trackers: &HashMap<String, NicRateTracker>) {
+    snapshot.host_nic = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let tracker = trackers.get(&node.id)?;
+            let (sampled_at, rx_bytes, tx_bytes) = tracker.last_sample?;
+            Some(HostNicSnapshot {
+                node_id: node.id.clone(),
+                rx_bytes,
+                tx_bytes,
+                down_rate_bps: tracker.down_rate_bps,
+                up_rate_bps: tracker.up_rate_bps,
+                sampled_at,
+            })
+        })
+        .collect();
+}
+
 #[derive(Debug, Clone)]
 struct CreateSubscriptionInput {
     username: String,
@@ -105,14 +137,22 @@ struct CreateSubscriptionInput {
 }
 
 #[derive(Debug, Clone)]
-struct CreateNodeInput {
+struct CreateHostInput {
     name: String,
     landing_host: String,
-    xray_port: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyNodeInput {
+    host_id: String,
+    name: String,
+    profile: String,
+    listen_port: String,
     publish_host: String,
     publish_port: String,
-    security: String,
     server_name: String,
+    websocket_path: String,
+    vless_encryption: String,
     reality_public_key: String,
     reality_short_id: String,
     reality_fingerprint: String,
@@ -144,7 +184,8 @@ struct EditSubscriptionInput {
 
 enum TuiCommand {
     CreateSubscription(CreateSubscriptionInput),
-    CreateNode(CreateNodeInput),
+    CreateHost(CreateHostInput),
+    CreateProxyNode(ProxyNodeInput),
     RevokeNode(String),
     ShowUser(String),
     ResetSubscription {
@@ -176,16 +217,25 @@ enum TuiCommand {
         user_id: String,
         subscription_id: String,
     },
-    UpdateNode {
+    UpdateHost {
         node_id: String,
-        input: CreateNodeInput,
+        input: CreateHostInput,
     },
-    SetNodeStatus {
+    SetHostStatus {
         node_id: String,
         status: String,
     },
+    UpdateProxyNode {
+        proxy_node_id: String,
+        input: ProxyNodeInput,
+    },
+    SetProxyNodeStatus {
+        proxy_node_id: String,
+        status: String,
+    },
+    DeleteProxyNode(String),
     ShowAgentUpgrade(String),
-    DeleteNode(String),
+    DeleteHost(String),
 }
 
 pub async fn run(
@@ -201,6 +251,7 @@ pub async fn run(
     let mut refresh = tokio::time::interval(Duration::from_secs(2));
     let mut user_detail = None;
     let mut rate_tracker = NicRateTracker::default();
+    let mut host_rate_trackers = HashMap::<String, NicRateTracker>::new();
 
     loop {
         tokio::select! {
@@ -210,8 +261,20 @@ pub async fn run(
             }
             _ = refresh.tick() => {
                 rate_tracker.observe(database.latest_nic_totals().await.unwrap_or_default());
+                if let Ok(totals) = database.latest_nic_totals_by_node().await {
+                    let active = totals.iter().map(|total| total.node_id.as_str()).collect::<std::collections::HashSet<_>>();
+                    host_rate_trackers.retain(|node_id, _| active.contains(node_id.as_str()));
+                    for total in totals {
+                        host_rate_trackers.entry(total.node_id).or_default().observe(Some(models::NicCounterTotals {
+                            rx_bytes: total.rx_bytes,
+                            tx_bytes: total.tx_bytes,
+                            sampled_at: total.sampled_at,
+                        }));
+                    }
+                }
                 let mut snapshot = load_snapshot(&state, &database, String::new(), user_detail.clone()).await?;
                 rate_tracker.apply(&mut snapshot);
+                apply_host_nic_rates(&mut snapshot, &host_rate_trackers);
                 if snapshot_tx.send(snapshot).is_err() {
                     break;
                 }
@@ -222,7 +285,8 @@ pub async fn run(
                 };
                 let result = match command {
                     TuiCommand::CreateSubscription(input) => create_subscription(&database, &subscription_base_url, input).await,
-                    TuiCommand::CreateNode(input) => create_node(&database, &grpc_addr, &agent_install, input).await,
+                    TuiCommand::CreateHost(input) => create_host(&database, &grpc_addr, &agent_install, input).await,
+                    TuiCommand::CreateProxyNode(input) => create_proxy_node(&database, input).await,
                     TuiCommand::RevokeNode(node_id) => revoke_node(&database, &node_id).await,
                     TuiCommand::ShowUser(user_id) => {
                         match database.user_detail(&user_id).await {
@@ -321,16 +385,23 @@ pub async fn run(
                         rotate_subscription_uuid(&database, &subscription_id).await,
                     )
                     .await,
-                    TuiCommand::UpdateNode { node_id, input } => {
-                        update_node(&database, &node_id, input).await
+                    TuiCommand::UpdateHost { node_id, input } => {
+                        update_host(&database, &node_id, input).await
                     }
-                    TuiCommand::SetNodeStatus { node_id, status } => {
-                        set_node_status(&database, &node_id, &status).await
+                    TuiCommand::SetHostStatus { node_id, status } => {
+                        set_host_status(&database, &node_id, &status).await
                     }
+                    TuiCommand::UpdateProxyNode { proxy_node_id, input } => {
+                        update_proxy_node(&database, &proxy_node_id, input).await
+                    }
+                    TuiCommand::SetProxyNodeStatus { proxy_node_id, status } => {
+                        set_proxy_node_status(&database, &proxy_node_id, &status).await
+                    }
+                    TuiCommand::DeleteProxyNode(proxy_node_id) => delete_proxy_node(&database, &proxy_node_id).await,
                     TuiCommand::ShowAgentUpgrade(node_id) => {
                         agent_upgrade_command(&agent_install, &node_id)
                     }
-                    TuiCommand::DeleteNode(node_id) => delete_node(&database, &node_id).await,
+                    TuiCommand::DeleteHost(node_id) => delete_host(&database, &node_id).await,
                 };
                 let notice = match result {
                     Ok(message) => message,
@@ -339,6 +410,7 @@ pub async fn run(
                 let snapshot = {
                     let mut snapshot = load_snapshot(&state, &database, notice, user_detail.clone()).await?;
                     rate_tracker.apply(&mut snapshot);
+                    apply_host_nic_rates(&mut snapshot, &host_rate_trackers);
                     snapshot
                 };
                 if snapshot_tx.send(snapshot).is_err() {
@@ -353,16 +425,16 @@ pub async fn run(
 async fn revoke_node(database: &Database, node_id: &str) -> anyhow::Result<String> {
     let node_id = node_id.trim();
     if node_id.is_empty() {
-        anyhow::bail!("node ID is required");
+        anyhow::bail!("host ID is required");
     }
     let revoked = database
         .revoke_node_certificates(node_id, Utc::now().timestamp())
         .await?;
     if revoked == 0 {
-        anyhow::bail!("node has no active Agent certificate");
+        anyhow::bail!("host has no active Agent certificate");
     }
     Ok(format!(
-        "revoked {revoked} Agent certificate(s) for node {node_id}"
+        "revoked {revoked} Agent certificate(s) for host {node_id}"
     ))
 }
 
@@ -544,16 +616,57 @@ async fn rotate_subscription_uuid(
     Ok(format!("subscription UUID rotated; new UUID: {uuid}"))
 }
 
-async fn update_node(
+async fn update_host(
     database: &Database,
     node_id: &str,
-    input: CreateNodeInput,
+    input: CreateHostInput,
 ) -> anyhow::Result<String> {
-    let xray_listen_port = input
-        .xray_port
+    if !database
+        .update_managed_host(
+            node_id,
+            &models::UpdateManagedHost {
+                name: input.name.trim().to_string(),
+                landing_host: input.landing_host.trim().to_string(),
+                updated_at: Utc::now().timestamp(),
+            },
+        )
+        .await?
+    {
+        anyhow::bail!("host no longer exists");
+    }
+    Ok(format!("updated host {node_id}"))
+}
+
+async fn set_host_status(
+    database: &Database,
+    node_id: &str,
+    status: &str,
+) -> anyhow::Result<String> {
+    if !database
+        .set_node_management_status(node_id, status, Utc::now().timestamp())
+        .await?
+    {
+        anyhow::bail!("host no longer exists");
+    }
+    Ok(format!("host {node_id} is now {status}"))
+}
+
+async fn delete_host(database: &Database, node_id: &str) -> anyhow::Result<String> {
+    if !database
+        .delete_node(node_id, Utc::now().timestamp())
+        .await?
+    {
+        anyhow::bail!("host no longer exists");
+    }
+    Ok(format!("logically deleted host {node_id}"))
+}
+
+fn proxy_node_model(input: ProxyNodeInput) -> anyhow::Result<models::UpdateProxyNode> {
+    let listen_port = input
+        .listen_port
         .trim()
         .parse::<i64>()
-        .context("invalid Xray port")?;
+        .context("invalid Xray listen port")?;
     let publish_host =
         (!input.publish_host.trim().is_empty()).then(|| input.publish_host.trim().to_string());
     let publish_port = if input.publish_port.trim().is_empty() {
@@ -567,53 +680,105 @@ async fn update_node(
                 .context("invalid publish port")?,
         )
     };
-    let optional = |value: String| (!value.trim().is_empty()).then(|| value.trim().to_string());
-    if !database
-        .update_node(
-            node_id,
-            &models::UpdateNode {
-                name: input.name.trim().to_string(),
-                landing_host: input.landing_host.trim().to_string(),
-                xray_listen_port,
-                publish_host,
-                publish_port,
-                security: input.security.trim().to_ascii_lowercase(),
-                server_name: optional(input.server_name),
-                reality_public_key: optional(input.reality_public_key),
-                reality_short_id: optional(input.reality_short_id),
-                reality_fingerprint: optional(input.reality_fingerprint),
-                updated_at: Utc::now().timestamp(),
-            },
-        )
-        .await?
-    {
-        anyhow::bail!("node no longer exists");
+    if publish_host.is_some() != publish_port.is_some() {
+        anyhow::bail!("publish host and port must be entered together");
     }
-    Ok(format!("updated node {node_id}"))
+    let optional = |value: String| (!value.trim().is_empty()).then(|| value.trim().to_string());
+    let (protocol, transport, security) = match input.profile.trim() {
+        "vless-reality" => ("vless", "tcp", "reality"),
+        "vless-encryption" => ("vless", "tcp", "none"),
+        "vless-ws" => ("vless", "ws", "none"),
+        "ss-2022" => {
+            anyhow::bail!("SS2022 credentials and Agent deployment are not implemented yet")
+        }
+        _ => anyhow::bail!("unknown Xray node profile"),
+    };
+    Ok(models::UpdateProxyNode {
+        host_id: input.host_id.trim().to_string(),
+        name: input.name.trim().to_string(),
+        listen_port,
+        publish_host,
+        publish_port,
+        protocol: protocol.into(),
+        transport: transport.into(),
+        security: security.into(),
+        server_name: optional(input.server_name),
+        websocket_path: optional(input.websocket_path),
+        vless_encryption: optional(input.vless_encryption),
+        reality_public_key: optional(input.reality_public_key),
+        reality_short_id: optional(input.reality_short_id),
+        reality_fingerprint: optional(input.reality_fingerprint),
+        updated_at: Utc::now().timestamp(),
+    })
 }
 
-async fn set_node_status(
+async fn create_proxy_node(database: &Database, input: ProxyNodeInput) -> anyhow::Result<String> {
+    let node = proxy_node_model(input)?;
+    let proxy_node_id = Uuid::now_v7().to_string();
+    database
+        .create_proxy_node_with_status(
+            &models::NewProxyNode {
+                id: proxy_node_id.clone(),
+                host_id: node.host_id,
+                name: node.name,
+                listen_port: node.listen_port,
+                publish_host: node.publish_host,
+                publish_port: node.publish_port,
+                protocol: node.protocol,
+                transport: node.transport,
+                security: node.security,
+                server_name: node.server_name,
+                websocket_path: node.websocket_path,
+                vless_encryption: node.vless_encryption,
+                reality_public_key: node.reality_public_key,
+                reality_short_id: node.reality_short_id,
+                reality_fingerprint: node.reality_fingerprint,
+                created_at: node.updated_at,
+            },
+            "disabled",
+        )
+        .await?;
+    Ok(format!(
+        "saved disabled Xray node {proxy_node_id}; Agent multi-inbound deployment is pending"
+    ))
+}
+
+async fn update_proxy_node(
     database: &Database,
-    node_id: &str,
+    proxy_node_id: &str,
+    input: ProxyNodeInput,
+) -> anyhow::Result<String> {
+    if !database
+        .update_proxy_node(proxy_node_id, &proxy_node_model(input)?)
+        .await?
+    {
+        anyhow::bail!("Xray node no longer exists");
+    }
+    Ok(format!("updated Xray node {proxy_node_id}"))
+}
+
+async fn set_proxy_node_status(
+    database: &Database,
+    proxy_node_id: &str,
     status: &str,
 ) -> anyhow::Result<String> {
     if !database
-        .set_node_management_status(node_id, status, Utc::now().timestamp())
+        .set_proxy_node_status(proxy_node_id, status, Utc::now().timestamp())
         .await?
     {
-        anyhow::bail!("node no longer exists");
+        anyhow::bail!("Xray node no longer exists");
     }
-    Ok(format!("node {node_id} is now {status}"))
+    Ok(format!("Xray node {proxy_node_id} is now {status}"))
 }
 
-async fn delete_node(database: &Database, node_id: &str) -> anyhow::Result<String> {
+async fn delete_proxy_node(database: &Database, proxy_node_id: &str) -> anyhow::Result<String> {
     if !database
-        .delete_node(node_id, Utc::now().timestamp())
+        .delete_proxy_node(proxy_node_id, Utc::now().timestamp())
         .await?
     {
-        anyhow::bail!("node no longer exists");
+        anyhow::bail!("Xray node no longer exists");
     }
-    Ok(format!("logically deleted node {node_id}"))
+    Ok(format!("logically deleted Xray node {proxy_node_id}"))
 }
 
 async fn load_snapshot(
@@ -625,16 +790,22 @@ async fn load_snapshot(
     database
         .advance_billing_cycles(Utc::now().timestamp())
         .await?;
-    let (connected_agents, last_agent_event) = {
+    let (connected_agents, last_agent_event, agent_events) = {
         let runtime = state.read().await;
-        (runtime.connected_agents, runtime.last_agent_event.clone())
+        (
+            runtime.connected_agents,
+            runtime.last_agent_event.clone(),
+            runtime.agent_events.iter().cloned().collect(),
+        )
     };
     Ok(TuiSnapshot {
         connected_agents,
         last_agent_event,
         users: database.list_user_summaries(Utc::now().timestamp()).await?,
         nodes: database.list_node_overviews().await?,
+        proxy_nodes: database.list_proxy_nodes().await?,
         interfaces: database.list_recent_interfaces().await?,
+        agent_events,
         user_detail,
         notice,
         ..TuiSnapshot::default()
@@ -782,63 +953,23 @@ async fn create_subscription(
     ))
 }
 
-async fn create_node(
+async fn create_host(
     database: &Database,
     grpc_addr: &str,
     agent_install: &AgentInstallConfig,
-    input: CreateNodeInput,
+    input: CreateHostInput,
 ) -> anyhow::Result<String> {
     let name = input.name.trim().to_string();
     let landing_host = input.landing_host.trim().to_string();
-    let xray_port = input
-        .xray_port
-        .trim()
-        .parse::<i64>()
-        .context("invalid Xray port")?;
-    let publish_host = input.publish_host.trim();
-    let publish_port = input.publish_port.trim();
-    let publish_host = (!publish_host.is_empty()).then(|| publish_host.to_string());
-    let publish_port = if publish_port.is_empty() {
-        None
-    } else {
-        Some(
-            publish_port
-                .parse::<i64>()
-                .context("invalid publish port")?,
-        )
-    };
-    if publish_host.is_some() != publish_port.is_some() {
-        anyhow::bail!("publish host and port must be entered together");
-    }
-    let security = if input.security.trim().is_empty() {
-        "none".to_string()
-    } else {
-        input.security.trim().to_ascii_lowercase()
-    };
-    let optional = |value: String| (!value.trim().is_empty()).then(|| value.trim().to_string());
-    let server_name = optional(input.server_name);
-    let reality_public_key = optional(input.reality_public_key);
-    let reality_short_id = optional(input.reality_short_id);
-    let reality_fingerprint = optional(input.reality_fingerprint);
     let now = Utc::now().timestamp();
     let node_id = Uuid::now_v7().to_string();
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     database
-        .create_node_with_registration(
-            &models::NewNode {
+        .create_managed_host_with_registration(
+            &models::NewManagedHost {
                 id: node_id.clone(),
                 name,
                 landing_host,
-                xray_listen_port: xray_port,
-                publish_host,
-                publish_port,
-                protocol: "vless".into(),
-                transport: "tcp".into(),
-                security,
-                server_name,
-                reality_public_key,
-                reality_short_id,
-                reality_fingerprint,
                 created_at: now,
             },
             &models::NewRegistrationToken {
@@ -850,12 +981,12 @@ async fn create_node(
             },
         )
         .await
-        .context("store node and registration token")?;
+        .context("store host and registration token")?;
     if agent_install.enabled {
         let binary_args = agent_binary_args(agent_install)?;
         let ca_arg = agent_ca_arg(agent_install)?;
         Ok(format!(
-            "created node {node_id}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' {binary_args} {ca_arg}",
+            "created host {node_id}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' {binary_args} {ca_arg}",
             agent_install.script_url,
             agent_install.panel_endpoint,
             agent_install.enrollment_endpoint,
@@ -865,7 +996,7 @@ async fn create_node(
         ))
     } else {
         Ok(format!(
-            "created node {node_id}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
+            "created host {node_id}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
         ))
     }
 }
@@ -946,8 +1077,12 @@ fn agent_upgrade_command(
 enum Page {
     Dashboard,
     Users,
+    Nodes,
+    Hosts,
+    Logs,
     Create,
-    NodeCreate,
+    HostCreate,
+    ProxyNodeCreate,
     Revoke,
     UserDetail,
     NicBindings,
@@ -955,9 +1090,10 @@ enum Page {
     NicUnbindConfirm,
     SubscriptionEdit,
     SubscriptionRotateConfirm,
-    Nodes,
-    NodeEdit,
-    NodeDeleteConfirm,
+    HostEdit,
+    HostDeleteConfirm,
+    ProxyNodeEdit,
+    ProxyNodeDeleteConfirm,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -971,8 +1107,15 @@ struct FormState {
     active: usize,
 }
 
-struct NodeFormState {
-    fields: [String; 10],
+#[derive(Default)]
+struct HostFormState {
+    fields: [String; 2],
+    active: usize,
+}
+
+struct ProxyNodeFormState {
+    fields: [String; 11],
+    profile: usize,
     active: usize,
 }
 
@@ -994,10 +1137,10 @@ impl SubscriptionEditFormState {
         let detail = snapshot.user_detail.as_ref()?;
         let subscription = detail.subscriptions.get(selected_subscription)?;
         let node_ids = detail
-            .node_usage
+            .proxy_nodes
             .iter()
-            .filter(|usage| usage.subscription_id == subscription.id)
-            .map(|usage| usage.node_id.as_str())
+            .filter(|assignment| assignment.subscription_id == subscription.id)
+            .map(|assignment| assignment.proxy_node_id.as_str())
             .collect::<Vec<_>>()
             .join(",");
         Some(Self {
@@ -1087,68 +1230,116 @@ impl NicBindingFormState {
     }
 }
 
-impl Default for NodeFormState {
-    fn default() -> Self {
+impl HostFormState {
+    fn from_node(node: &models::NodeOverview) -> Self {
         Self {
-            fields: [
-                String::new(),
-                String::new(),
-                "443".into(),
-                String::new(),
-                String::new(),
-                "none".into(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ],
+            fields: [node.name.clone(), node.landing_host.clone()],
             active: 0,
+        }
+    }
+
+    fn input(&self) -> CreateHostInput {
+        CreateHostInput {
+            name: self.fields[0].clone(),
+            landing_host: self.fields[1].clone(),
         }
     }
 }
 
-impl NodeFormState {
-    fn from_node(node: &models::NodeOverview) -> Self {
+const PROXY_NODE_PROFILES: [&str; 4] = ["vless-reality", "vless-encryption", "vless-ws", "ss-2022"];
+
+impl ProxyNodeFormState {
+    fn new(snapshot: &TuiSnapshot) -> Self {
         Self {
             fields: [
-                node.name.clone(),
-                node.landing_host.clone(),
-                node.xray_listen_port.to_string(),
-                node.publish_host.clone().unwrap_or_default(),
-                node.publish_port
-                    .map_or_else(String::new, |port| port.to_string()),
-                node.security.clone(),
-                node.server_name.clone().unwrap_or_default(),
-                node.reality_public_key.clone().unwrap_or_default(),
-                node.reality_short_id.clone().unwrap_or_default(),
-                node.reality_fingerprint.clone().unwrap_or_default(),
+                snapshot
+                    .nodes
+                    .first()
+                    .map(|node| node.id.clone())
+                    .unwrap_or_default(),
+                String::new(),
+                "443".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "chrome".into(),
             ],
+            profile: 0,
             active: 0,
         }
     }
 
-    fn input(&self) -> CreateNodeInput {
-        CreateNodeInput {
-            name: self.fields[0].clone(),
-            landing_host: self.fields[1].clone(),
-            xray_port: self.fields[2].clone(),
+    fn from_node(node: &models::ProxyNodeRecord) -> Self {
+        let profile = match (
+            node.protocol.as_str(),
+            node.transport.as_str(),
+            node.security.as_str(),
+            node.vless_encryption.as_deref(),
+        ) {
+            ("vless", "tcp", "reality", _) => 0,
+            ("vless", "tcp", _, Some(_)) => 1,
+            ("vless", "ws", _, _) => 2,
+            ("shadowsocks", _, _, _) => 3,
+            _ => 1,
+        };
+        Self {
+            fields: [
+                node.host_id.clone(),
+                node.name.clone(),
+                node.listen_port.to_string(),
+                node.publish_host.clone().unwrap_or_default(),
+                node.publish_port
+                    .map_or_else(String::new, |port| port.to_string()),
+                node.server_name.clone().unwrap_or_default(),
+                node.websocket_path.clone().unwrap_or_default(),
+                node.vless_encryption.clone().unwrap_or_default(),
+                node.reality_public_key.clone().unwrap_or_default(),
+                node.reality_short_id.clone().unwrap_or_default(),
+                node.reality_fingerprint
+                    .clone()
+                    .unwrap_or_else(|| "chrome".into()),
+            ],
+            profile,
+            active: 0,
+        }
+    }
+
+    fn input(&self) -> ProxyNodeInput {
+        ProxyNodeInput {
+            host_id: self.fields[0].clone(),
+            name: self.fields[1].clone(),
+            profile: PROXY_NODE_PROFILES[self.profile].into(),
+            listen_port: self.fields[2].clone(),
             publish_host: self.fields[3].clone(),
             publish_port: self.fields[4].clone(),
-            security: self.fields[5].clone(),
-            server_name: self.fields[6].clone(),
-            reality_public_key: self.fields[7].clone(),
-            reality_short_id: self.fields[8].clone(),
-            reality_fingerprint: self.fields[9].clone(),
+            server_name: self.fields[5].clone(),
+            websocket_path: self.fields[6].clone(),
+            vless_encryption: self.fields[7].clone(),
+            reality_public_key: self.fields[8].clone(),
+            reality_short_id: self.fields[9].clone(),
+            reality_fingerprint: self.fields[10].clone(),
         }
+    }
+
+    fn cycle_profile(&mut self, forward: bool) {
+        self.profile = if forward {
+            (self.profile + 1) % PROXY_NODE_PROFILES.len()
+        } else {
+            (self.profile + PROXY_NODE_PROFILES.len() - 1) % PROXY_NODE_PROFILES.len()
+        };
     }
 }
 
 impl FormState {
     fn from_snapshot(snapshot: &TuiSnapshot) -> Self {
         let node_ids = snapshot
-            .nodes
+            .proxy_nodes
             .iter()
-            .filter(|node| node.management_status == "active")
+            .filter(|node| node.status == "active")
             .map(|node| node.id.as_str())
             .collect::<Vec<_>>()
             .join(",");
@@ -1195,7 +1386,8 @@ fn run_blocking(
         fields: Default::default(),
         active: 0,
     };
-    let mut node_form = NodeFormState::default();
+    let mut host_form = HostFormState::default();
+    let mut proxy_node_form = ProxyNodeFormState::new(&snapshot_rx.borrow());
     let mut nic_form = NicBindingFormState::from_snapshot(&snapshot_rx.borrow(), None);
     let mut subscription_form = None;
     let mut rotate_kind = RotateKind::Token;
@@ -1205,8 +1397,11 @@ fn run_blocking(
     let mut selected_subscription = 0_usize;
     let mut selected_binding = 0_usize;
     let mut selected_node = 0_usize;
-    let mut edit_node_id = String::new();
-    let mut delete_node_id = String::new();
+    let mut selected_proxy_node = 0_usize;
+    let mut edit_host_id = String::new();
+    let mut delete_host_id = String::new();
+    let mut edit_proxy_node_id = String::new();
+    let mut delete_proxy_node_id = String::new();
     let mut unbind_binding_id = String::new();
     let result = loop {
         let snapshot = snapshot_rx.borrow().clone();
@@ -1216,6 +1411,7 @@ fn run_blocking(
                 selected_subscription.min(detail.subscriptions.len().saturating_sub(1));
         }
         selected_node = selected_node.min(snapshot.nodes.len().saturating_sub(1));
+        selected_proxy_node = selected_proxy_node.min(snapshot.proxy_nodes.len().saturating_sub(1));
         terminal.draw(|frame| match page {
             Page::Dashboard => {
                 let area = draw_primary_shell(frame, &snapshot, 0);
@@ -1230,16 +1426,21 @@ fn run_blocking(
                 draw_users(frame, area, &snapshot, selected_user);
                 draw_create(frame, &snapshot, &form);
             }
-            Page::NodeCreate => {
-                let area = draw_primary_shell(frame, &snapshot, 2);
+            Page::HostCreate => {
+                let area = draw_primary_shell(frame, &snapshot, 3);
                 draw_nodes(frame, area, &snapshot, selected_node);
-                draw_node_create(frame, &node_form);
+                draw_host_create(frame, &host_form);
+            }
+            Page::ProxyNodeCreate => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_proxy_nodes(frame, area, &snapshot, selected_proxy_node);
+                draw_proxy_node_create(frame, &snapshot, &proxy_node_form);
             }
             Page::Revoke => {
                 let area = draw_primary_shell(
                     frame,
                     &snapshot,
-                    if revoke_returns_to_nodes { 2 } else { 0 },
+                    if revoke_returns_to_nodes { 3 } else { 0 },
                 );
                 if revoke_returns_to_nodes {
                     draw_nodes(frame, area, &snapshot, selected_node);
@@ -1277,17 +1478,35 @@ fn run_blocking(
             }
             Page::Nodes => {
                 let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_proxy_nodes(frame, area, &snapshot, selected_proxy_node);
+            }
+            Page::Hosts => {
+                let area = draw_primary_shell(frame, &snapshot, 3);
                 draw_nodes(frame, area, &snapshot, selected_node);
             }
-            Page::NodeEdit => {
-                let area = draw_primary_shell(frame, &snapshot, 2);
-                draw_nodes(frame, area, &snapshot, selected_node);
-                draw_node_edit(frame, &node_form, &edit_node_id);
+            Page::Logs => {
+                let area = draw_primary_shell(frame, &snapshot, 4);
+                draw_logs(frame, area, &snapshot);
             }
-            Page::NodeDeleteConfirm => {
-                let area = draw_primary_shell(frame, &snapshot, 2);
+            Page::HostEdit => {
+                let area = draw_primary_shell(frame, &snapshot, 3);
                 draw_nodes(frame, area, &snapshot, selected_node);
-                draw_node_delete_confirm(frame, &snapshot, &delete_node_id);
+                draw_host_edit(frame, &host_form, &edit_host_id);
+            }
+            Page::HostDeleteConfirm => {
+                let area = draw_primary_shell(frame, &snapshot, 3);
+                draw_nodes(frame, area, &snapshot, selected_node);
+                draw_host_delete_confirm(frame, &snapshot, &delete_host_id);
+            }
+            Page::ProxyNodeEdit => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_proxy_nodes(frame, area, &snapshot, selected_proxy_node);
+                draw_proxy_node_edit(frame, &snapshot, &proxy_node_form, &edit_proxy_node_id);
+            }
+            Page::ProxyNodeDeleteConfirm => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_proxy_nodes(frame, area, &snapshot, selected_proxy_node);
+                draw_proxy_node_delete_confirm(frame, &delete_proxy_node_id);
             }
         })?;
         if event::poll(Duration::from_millis(250))? {
@@ -1302,16 +1521,21 @@ fn run_blocking(
                             page = Page::Users;
                         }
                         KeyCode::Char('3') | KeyCode::Char('N') => {
-                            selected_node = 0;
+                            selected_proxy_node = 0;
                             page = Page::Nodes;
                         }
+                        KeyCode::Char('4') => {
+                            selected_node = 0;
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Char('5') => page = Page::Logs,
                         KeyCode::Char('c') => {
                             form = FormState::from_snapshot(&snapshot);
                             page = Page::Create;
                         }
                         KeyCode::Char('n') => {
-                            node_form = NodeFormState::default();
-                            page = Page::NodeCreate;
+                            proxy_node_form = ProxyNodeFormState::new(&snapshot);
+                            page = Page::ProxyNodeCreate;
                         }
                         KeyCode::Char('r') => {
                             revoke_returns_to_nodes = false;
@@ -1328,9 +1552,14 @@ fn run_blocking(
                         KeyCode::Char('q') => break Ok(()),
                         KeyCode::Esc | KeyCode::Char('1') => page = Page::Dashboard,
                         KeyCode::Tab | KeyCode::Char('3') => {
-                            selected_node = 0;
+                            selected_proxy_node = 0;
                             page = Page::Nodes;
                         }
+                        KeyCode::Char('4') => {
+                            selected_node = 0;
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Char('5') => page = Page::Logs,
                         KeyCode::Char('c') => {
                             form = FormState::from_snapshot(&snapshot);
                             page = Page::Create;
@@ -1375,17 +1604,42 @@ fn run_blocking(
                         KeyCode::Char(value) => form.fields[form.active].push(value),
                         _ => {}
                     },
-                    Page::NodeCreate => match key.code {
-                        KeyCode::Esc => page = Page::Nodes,
+                    Page::HostCreate => match key.code {
+                        KeyCode::Esc => page = Page::Hosts,
                         KeyCode::Tab | KeyCode::Down => {
-                            node_form.active = (node_form.active + 1) % 10
+                            host_form.active = (host_form.active + 1) % 2
                         }
                         KeyCode::BackTab | KeyCode::Up => {
-                            node_form.active = (node_form.active + 9) % 10
+                            host_form.active = (host_form.active + 1) % 2
                         }
                         KeyCode::Enter => {
                             if command_tx
-                                .blocking_send(TuiCommand::CreateNode(node_form.input()))
+                                .blocking_send(TuiCommand::CreateHost(host_form.input()))
+                                .is_err()
+                            {
+                                break Ok(());
+                            }
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Backspace => {
+                            host_form.fields[host_form.active].pop();
+                        }
+                        KeyCode::Char(value) => host_form.fields[host_form.active].push(value),
+                        _ => {}
+                    },
+                    Page::ProxyNodeCreate => match key.code {
+                        KeyCode::Esc => page = Page::Nodes,
+                        KeyCode::Tab | KeyCode::Down => {
+                            proxy_node_form.active = (proxy_node_form.active + 1) % 11
+                        }
+                        KeyCode::BackTab | KeyCode::Up => {
+                            proxy_node_form.active = (proxy_node_form.active + 10) % 11
+                        }
+                        KeyCode::Left => proxy_node_form.cycle_profile(false),
+                        KeyCode::Right => proxy_node_form.cycle_profile(true),
+                        KeyCode::Enter => {
+                            if command_tx
+                                .blocking_send(TuiCommand::CreateProxyNode(proxy_node_form.input()))
                                 .is_err()
                             {
                                 break Ok(());
@@ -1393,15 +1647,17 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            node_form.fields[node_form.active].pop();
+                            proxy_node_form.fields[proxy_node_form.active].pop();
                         }
-                        KeyCode::Char(value) => node_form.fields[node_form.active].push(value),
+                        KeyCode::Char(value) => {
+                            proxy_node_form.fields[proxy_node_form.active].push(value)
+                        }
                         _ => {}
                     },
                     Page::Revoke => match key.code {
                         KeyCode::Esc => {
                             page = if revoke_returns_to_nodes {
-                                Page::Nodes
+                                Page::Hosts
                             } else {
                                 Page::Dashboard
                             };
@@ -1414,7 +1670,7 @@ fn run_blocking(
                                 break Ok(());
                             }
                             page = if revoke_returns_to_nodes {
-                                Page::Nodes
+                                Page::Hosts
                             } else {
                                 Page::Dashboard
                             };
@@ -1674,23 +1930,75 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::Nodes => match key.code {
-                        KeyCode::Esc | KeyCode::Left | KeyCode::Tab | KeyCode::Char('1') => {
-                            page = Page::Dashboard
-                        }
+                        KeyCode::Char('q') => break Ok(()),
+                        KeyCode::Esc | KeyCode::Left | KeyCode::Char('1') => page = Page::Dashboard,
                         KeyCode::Char('2') => page = Page::Users,
+                        KeyCode::Tab | KeyCode::Char('4') => {
+                            selected_node = 0;
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Char('5') => page = Page::Logs,
+                        KeyCode::Up => selected_proxy_node = selected_proxy_node.saturating_sub(1),
+                        KeyCode::Down if !snapshot.proxy_nodes.is_empty() => {
+                            selected_proxy_node =
+                                (selected_proxy_node + 1).min(snapshot.proxy_nodes.len() - 1);
+                        }
+                        KeyCode::Char('n') => {
+                            proxy_node_form = ProxyNodeFormState::new(&snapshot);
+                            page = Page::ProxyNodeCreate;
+                        }
+                        KeyCode::Char('e') | KeyCode::Enter => {
+                            if let Some(node) = snapshot.proxy_nodes.get(selected_proxy_node) {
+                                edit_proxy_node_id = node.id.clone();
+                                proxy_node_form = ProxyNodeFormState::from_node(node);
+                                page = Page::ProxyNodeEdit;
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if let Some(node) = snapshot.proxy_nodes.get(selected_proxy_node) {
+                                let status = if node.status == "active" {
+                                    "disabled"
+                                } else {
+                                    "active"
+                                };
+                                if command_tx
+                                    .blocking_send(TuiCommand::SetProxyNodeStatus {
+                                        proxy_node_id: node.id.clone(),
+                                        status: status.into(),
+                                    })
+                                    .is_err()
+                                {
+                                    break Ok(());
+                                }
+                            }
+                        }
+                        KeyCode::Char('D') => {
+                            if let Some(node) = snapshot.proxy_nodes.get(selected_proxy_node) {
+                                delete_proxy_node_id = node.id.clone();
+                                page = Page::ProxyNodeDeleteConfirm;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Page::Hosts => match key.code {
+                        KeyCode::Char('q') => break Ok(()),
+                        KeyCode::Esc | KeyCode::Left | KeyCode::Char('1') => page = Page::Dashboard,
+                        KeyCode::Char('2') => page = Page::Users,
+                        KeyCode::Char('3') => page = Page::Nodes,
+                        KeyCode::Tab | KeyCode::Char('5') => page = Page::Logs,
                         KeyCode::Up => selected_node = selected_node.saturating_sub(1),
                         KeyCode::Down if !snapshot.nodes.is_empty() => {
                             selected_node = (selected_node + 1).min(snapshot.nodes.len() - 1);
                         }
                         KeyCode::Char('n') => {
-                            node_form = NodeFormState::default();
-                            page = Page::NodeCreate;
+                            host_form = HostFormState::default();
+                            page = Page::HostCreate;
                         }
                         KeyCode::Char('e') | KeyCode::Enter => {
                             if let Some(node) = snapshot.nodes.get(selected_node) {
-                                edit_node_id = node.id.clone();
-                                node_form = NodeFormState::from_node(node);
-                                page = Page::NodeEdit;
+                                edit_host_id = node.id.clone();
+                                host_form = HostFormState::from_node(node);
+                                page = Page::HostEdit;
                             }
                         }
                         KeyCode::Char('d') => {
@@ -1701,7 +2009,7 @@ fn run_blocking(
                                     "active"
                                 };
                                 if command_tx
-                                    .blocking_send(TuiCommand::SetNodeStatus {
+                                    .blocking_send(TuiCommand::SetHostStatus {
                                         node_id: node.id.clone(),
                                         status: status.into(),
                                     })
@@ -1730,25 +2038,66 @@ fn run_blocking(
                         }
                         KeyCode::Char('D') => {
                             if let Some(node) = snapshot.nodes.get(selected_node) {
-                                delete_node_id = node.id.clone();
-                                page = Page::NodeDeleteConfirm;
+                                delete_host_id = node.id.clone();
+                                page = Page::HostDeleteConfirm;
                             }
                         }
                         _ => {}
                     },
-                    Page::NodeEdit => match key.code {
-                        KeyCode::Esc => page = Page::Nodes,
+                    Page::HostEdit => match key.code {
+                        KeyCode::Esc => page = Page::Hosts,
                         KeyCode::Tab | KeyCode::Down => {
-                            node_form.active = (node_form.active + 1) % 10;
+                            host_form.active = (host_form.active + 1) % 2;
                         }
                         KeyCode::BackTab | KeyCode::Up => {
-                            node_form.active = (node_form.active + 9) % 10;
+                            host_form.active = (host_form.active + 1) % 2;
                         }
                         KeyCode::Enter => {
                             if command_tx
-                                .blocking_send(TuiCommand::UpdateNode {
-                                    node_id: edit_node_id.clone(),
-                                    input: node_form.input(),
+                                .blocking_send(TuiCommand::UpdateHost {
+                                    node_id: edit_host_id.clone(),
+                                    input: host_form.input(),
+                                })
+                                .is_err()
+                            {
+                                break Ok(());
+                            }
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Backspace => {
+                            host_form.fields[host_form.active].pop();
+                        }
+                        KeyCode::Char(value) => host_form.fields[host_form.active].push(value),
+                        _ => {}
+                    },
+                    Page::HostDeleteConfirm => match key.code {
+                        KeyCode::Esc => page = Page::Hosts,
+                        KeyCode::Enter => {
+                            if command_tx
+                                .blocking_send(TuiCommand::DeleteHost(delete_host_id.clone()))
+                                .is_err()
+                            {
+                                break Ok(());
+                            }
+                            page = Page::Hosts;
+                        }
+                        _ => {}
+                    },
+                    Page::ProxyNodeEdit => match key.code {
+                        KeyCode::Esc => page = Page::Nodes,
+                        KeyCode::Tab | KeyCode::Down => {
+                            proxy_node_form.active = (proxy_node_form.active + 1) % 11;
+                        }
+                        KeyCode::BackTab | KeyCode::Up => {
+                            proxy_node_form.active = (proxy_node_form.active + 10) % 11;
+                        }
+                        KeyCode::Left => proxy_node_form.cycle_profile(false),
+                        KeyCode::Right => proxy_node_form.cycle_profile(true),
+                        KeyCode::Enter => {
+                            if command_tx
+                                .blocking_send(TuiCommand::UpdateProxyNode {
+                                    proxy_node_id: edit_proxy_node_id.clone(),
+                                    input: proxy_node_form.input(),
                                 })
                                 .is_err()
                             {
@@ -1757,22 +2106,34 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            node_form.fields[node_form.active].pop();
+                            proxy_node_form.fields[proxy_node_form.active].pop();
                         }
-                        KeyCode::Char(value) => node_form.fields[node_form.active].push(value),
+                        KeyCode::Char(value) => {
+                            proxy_node_form.fields[proxy_node_form.active].push(value)
+                        }
                         _ => {}
                     },
-                    Page::NodeDeleteConfirm => match key.code {
+                    Page::ProxyNodeDeleteConfirm => match key.code {
                         KeyCode::Esc => page = Page::Nodes,
                         KeyCode::Enter => {
                             if command_tx
-                                .blocking_send(TuiCommand::DeleteNode(delete_node_id.clone()))
+                                .blocking_send(TuiCommand::DeleteProxyNode(
+                                    delete_proxy_node_id.clone(),
+                                ))
                                 .is_err()
                             {
                                 break Ok(());
                             }
                             page = Page::Nodes;
                         }
+                        _ => {}
+                    },
+                    Page::Logs => match key.code {
+                        KeyCode::Char('q') => break Ok(()),
+                        KeyCode::Tab | KeyCode::Esc | KeyCode::Char('1') => page = Page::Dashboard,
+                        KeyCode::Char('2') => page = Page::Users,
+                        KeyCode::Char('3') => page = Page::Nodes,
+                        KeyCode::Char('4') => page = Page::Hosts,
                         _ => {}
                     },
                 }
@@ -1802,20 +2163,26 @@ fn draw_primary_shell(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(18), Constraint::Length(34)])
         .split(areas[0]);
-    let tabs = Tabs::new(vec!["仪表盘 [1]", "用户 [2]", "节点 [3]"])
-        .select(selected_tab)
-        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::Green)),
-        );
+    let tabs = Tabs::new(vec![
+        "仪表盘 [1]",
+        "用户 [2]",
+        "节点 [3]",
+        "主机 [4]",
+        "日志 [5]",
+    ])
+    .select(selected_tab)
+    .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+    .style(Style::default().fg(Color::DarkGray))
+    .highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Green)),
+    );
     frame.render_widget(tabs, header[0]);
     frame.render_widget(
         Paragraph::new(format!(
@@ -1836,9 +2203,11 @@ fn draw_primary_shell(
 
     let (footer, footer_style) = if snapshot.notice.is_empty() {
         let keys = match selected_tab {
-            0 => "[Tab/2] 用户  [3] 节点  [c] 新建订阅  [n] 新建节点  [q] 退出",
-            1 => "[↑↓] 选择  [Enter] 详情  [c] 新建订阅  [1] 仪表盘  [3] 节点  [q] 退出",
-            _ => "[↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建  [1] 仪表盘  [2] 用户",
+            0 => "[Tab/2] 用户  [3] 节点  [4] 主机  [5] 日志  [c] 新建用户  [q] 退出",
+            1 => "[↑↓] 选择  [Enter] 详情  [c] 新建用户  [3] 节点  [4] 主机  [q] 退出",
+            2 => "[↑↓] 选择  [Enter/e] 编辑  [n] 新建  [d] 启停  [D] 删除  [4/Tab] 主机",
+            3 => "[↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建主机  [5] 日志",
+            _ => "[1-4/Tab] 切换页面  [q] 退出",
         };
         (keys, Style::default().fg(Color::DarkGray))
     } else {
@@ -1869,7 +2238,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnap
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(5),
+            Constraint::Length(3),
             Constraint::Length(rate_height),
             Constraint::Length(stats_height),
             Constraint::Min(6),
@@ -1890,7 +2259,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnap
                 snapshot.connected_agents.to_string(),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw("    在线节点 "),
+            Span::raw("    在线主机 "),
             Span::styled(online_nodes.to_string(), Style::default().fg(Color::Cyan)),
             Span::raw("    最近事件 "),
             Span::styled(
@@ -1902,52 +2271,9 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnap
         areas[0],
     );
 
-    let metrics = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(areas[1]);
-    let cpu_values = snapshot
-        .nodes
-        .iter()
-        .filter_map(|node| node.cpu_usage_basis_points)
-        .collect::<Vec<_>>();
-    let cpu = if cpu_values.is_empty() {
-        None
-    } else {
-        Some(cpu_values.iter().sum::<i64>() / cpu_values.len() as i64)
-    };
-    draw_metric_gauge(
-        frame,
-        metrics[0],
-        "平均 CPU",
-        cpu.unwrap_or_default(),
-        10_000,
-        cpu.map_or_else(
-            || "暂无数据".into(),
-            |value| format!("{:.1}%", value as f64 / 100.0),
-        ),
-    );
-    let (memory_used, memory_total) = aggregate_resource(snapshot, ResourceKind::Memory);
-    draw_metric_gauge(
-        frame,
-        metrics[1],
-        "内存",
-        memory_used,
-        memory_total,
-        resource_label(memory_used, memory_total),
-    );
-    let (disk_used, disk_total) = aggregate_resource(snapshot, ResourceKind::Disk);
-    draw_metric_gauge(
-        frame,
-        metrics[2],
-        "磁盘",
-        disk_used,
-        disk_total,
-        resource_label(disk_used, disk_total),
+    frame.render_widget(
+        Paragraph::new(system_metrics_line(snapshot)).block(panel_block("主机资源")),
+        areas[1],
     );
 
     if rate_height > 0 {
@@ -2020,39 +2346,35 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnap
     .block(panel_block(&users_title));
     frame.render_widget(users, areas[4]);
 
-    let node_rows = snapshot.nodes.iter().take(5).map(|node| {
+    let node_rows = snapshot.proxy_nodes.iter().take(5).map(|node| {
         Row::new(vec![
             Cell::from(node.name.clone()),
-            Cell::from(node.node_status.clone())
-                .style(Style::default().fg(status_color(&node.node_status))),
-            Cell::from(node.agent_status.clone().unwrap_or_else(|| "未注册".into())),
-            Cell::from(format_cpu(node.cpu_usage_basis_points)),
-            Cell::from(resource_label(
-                node.memory_used_bytes.unwrap_or_default(),
-                node.memory_total_bytes.unwrap_or_default(),
-            )),
-            Cell::from(published_endpoint(node)),
+            Cell::from(node.host_name.clone()),
+            Cell::from(format!("{}-{}", node.protocol, node.transport)),
+            Cell::from(node.security.clone()),
+            Cell::from(proxy_published_endpoint(node)),
+            Cell::from(node.status.clone()).style(Style::default().fg(status_color(&node.status))),
         ])
     });
-    let nodes_title = format!("节点摘要 · {}", snapshot.nodes.len());
+    let nodes_title = format!("节点摘要 · {}", snapshot.proxy_nodes.len());
     let nodes = Table::new(
         node_rows,
         [
             Constraint::Percentage(20),
+            Constraint::Percentage(18),
+            Constraint::Length(15),
+            Constraint::Length(10),
+            Constraint::Min(18),
             Constraint::Length(9),
-            Constraint::Length(12),
-            Constraint::Length(8),
-            Constraint::Length(19),
-            Constraint::Min(16),
         ],
     )
     .header(table_header([
         "节点",
-        "运行状态",
-        "Agent",
-        "CPU",
-        "内存",
+        "主机",
+        "协议",
+        "安全",
         "发布地址",
+        "状态",
     ]))
     .column_spacing(1)
     .block(panel_block(&nodes_title));
@@ -2142,6 +2464,180 @@ fn user_stats_line(snapshot: &TuiSnapshot) -> Line<'static> {
     ])
 }
 
+fn system_metrics_line(snapshot: &TuiSnapshot) -> Line<'static> {
+    let cpu_values = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node.cpu_usage_basis_points)
+        .collect::<Vec<_>>();
+    let cpu = if cpu_values.is_empty() {
+        "-".into()
+    } else {
+        format!(
+            "{:.1}%",
+            cpu_values.iter().sum::<i64>() as f64 / cpu_values.len() as f64 / 100.0
+        )
+    };
+    let loads = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| node.load_1_milli)
+        .collect::<Vec<_>>();
+    let load = if loads.is_empty() {
+        "-".into()
+    } else {
+        format!(
+            "{:.2}",
+            loads.iter().sum::<i64>() as f64 / loads.len() as f64 / 1000.0
+        )
+    };
+    let (memory_used, memory_total) = aggregate_resource(snapshot, ResourceKind::Memory);
+    let (disk_used, disk_total) = aggregate_resource(snapshot, ResourceKind::Disk);
+    Line::from(vec![
+        Span::raw("主机 "),
+        Span::styled(
+            snapshot.nodes.len().to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  在线 "),
+        Span::styled(
+            snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.node_status == "online")
+                .count()
+                .to_string(),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  CPU "),
+        Span::styled(cpu, Style::default().fg(Color::Cyan)),
+        Span::raw("  内存 "),
+        Span::styled(
+            resource_label(memory_used, memory_total),
+            Style::default().fg(Color::LightBlue),
+        ),
+        Span::raw("  磁盘 "),
+        Span::styled(
+            resource_label(disk_used, disk_total),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw("  负载 "),
+        Span::styled(load, Style::default().fg(Color::Yellow)),
+    ])
+}
+
+fn proxy_published_endpoint(node: &models::ProxyNodeRecord) -> String {
+    format!(
+        "{}:{}",
+        node.publish_host.as_deref().unwrap_or(&node.landing_host),
+        node.publish_port.unwrap_or(node.listen_port)
+    )
+}
+
+fn draw_proxy_nodes(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    selected: usize,
+) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .split(area);
+    let rows = snapshot
+        .proxy_nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            Row::new(vec![
+                Cell::from(node.name.clone()),
+                Cell::from(node.host_name.clone()),
+                Cell::from(format!("{}-{}", node.protocol, node.transport)),
+                Cell::from(node.security.clone()),
+                Cell::from(node.listen_port.to_string()),
+                Cell::from(proxy_published_endpoint(node)),
+                Cell::from(node.status.clone())
+                    .style(Style::default().fg(status_color(&node.status))),
+            ])
+            .style(selected_style(index == selected))
+        });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Percentage(18),
+                Constraint::Percentage(17),
+                Constraint::Length(16),
+                Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Min(18),
+                Constraint::Length(9),
+            ],
+        )
+        .header(table_header([
+            "节点",
+            "主机",
+            "协议",
+            "安全",
+            "端口",
+            "发布地址",
+            "状态",
+        ]))
+        .column_spacing(1)
+        .block(panel_block(&format!(
+            "Xray 节点 · {}",
+            snapshot.proxy_nodes.len()
+        ))),
+        areas[0],
+    );
+    let detail = snapshot.proxy_nodes.get(selected).map_or_else(
+        || "尚未创建协议节点".to_string(),
+        |node| {
+            format!(
+                "ID: {}  主机: {} ({})\n协议: {}  传输: {}  安全: {}  监听: {}\nServer Name: {}  WS Path: {}\nReality Public Key: {}",
+                node.id,
+                node.host_name,
+                node.host_id,
+                node.protocol,
+                node.transport,
+                node.security,
+                node.listen_port,
+                node.server_name.as_deref().unwrap_or("-"),
+                node.websocket_path.as_deref().unwrap_or("-"),
+                node.reality_public_key.as_deref().unwrap_or("-"),
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: true })
+            .block(panel_block("选中节点")),
+        areas[1],
+    );
+}
+
+fn draw_logs(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnapshot) {
+    let lines = if snapshot.agent_events.is_empty() {
+        vec![Line::from(Span::styled(
+            "暂无 Agent 事件",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        snapshot
+            .agent_events
+            .iter()
+            .rev()
+            .map(|event| Line::from(event.clone()))
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel_block("Agent 事件日志 · 最新在前")),
+        area,
+    );
+}
+
 fn draw_users(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -2214,8 +2710,8 @@ fn draw_nodes(
 ) {
     if area.width < 48 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new(format!("节点总数: {}", snapshot.nodes.len()))
-                .block(panel_block("节点管理")),
+            Paragraph::new(format!("主机总数: {}", snapshot.nodes.len()))
+                .block(panel_block("主机管理")),
             area,
         );
         return;
@@ -2224,56 +2720,18 @@ fn draw_nodes(
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(3),
             Constraint::Min(7),
             Constraint::Length(7),
         ])
         .split(area);
-    let metrics = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(areas[0]);
-    let enabled = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.management_status == "active")
-        .count();
-    let online = snapshot
-        .nodes
-        .iter()
-        .filter(|node| node.node_status == "online")
-        .count();
-    draw_count_metric(
-        frame,
-        metrics[0],
-        "节点",
-        snapshot.nodes.len(),
-        format!("启用 {enabled}  在线 {online}"),
-    );
-    let (memory_used, memory_total) = aggregate_resource(snapshot, ResourceKind::Memory);
-    draw_metric_gauge(
-        frame,
-        metrics[1],
-        "节点总内存",
-        memory_used,
-        memory_total,
-        resource_label(memory_used, memory_total),
-    );
-    let (disk_used, disk_total) = aggregate_resource(snapshot, ResourceKind::Disk);
-    draw_metric_gauge(
-        frame,
-        metrics[2],
-        "节点总磁盘",
-        disk_used,
-        disk_total,
-        resource_label(disk_used, disk_total),
+    frame.render_widget(
+        Paragraph::new(system_metrics_line(snapshot)).block(panel_block("主机资源")),
+        areas[0],
     );
 
     let rows = snapshot.nodes.iter().enumerate().map(|(index, node)| {
+        let nic = snapshot.host_nic.iter().find(|nic| nic.node_id == node.id);
         Row::new(vec![
             Cell::from(node.name.clone()),
             Cell::from(node.management_status.clone())
@@ -2281,11 +2739,26 @@ fn draw_nodes(
             Cell::from(node.node_status.clone())
                 .style(Style::default().fg(status_color(&node.node_status))),
             Cell::from(node.agent_status.clone().unwrap_or_else(|| "未注册".into())),
-            Cell::from(published_endpoint(node)),
-            Cell::from(format_cpu(node.cpu_usage_basis_points)),
-            Cell::from(resource_percent(
-                node.memory_used_bytes,
-                node.memory_total_bytes,
+            Cell::from(node.landing_host.clone()),
+            Cell::from(nic.map_or_else(
+                || "-".into(),
+                |nic| {
+                    format!(
+                        "↓{}/s ↑{}/s",
+                        format_bytes(nic.down_rate_bps as i64),
+                        format_bytes(nic.up_rate_bps as i64)
+                    )
+                },
+            )),
+            Cell::from(nic.map_or_else(
+                || "-".into(),
+                |nic| {
+                    format!(
+                        "↓{} ↑{}",
+                        format_bytes(nic.rx_bytes),
+                        format_bytes(nic.tx_bytes)
+                    )
+                },
             )),
         ])
         .style(selected_style(index == selected_node))
@@ -2298,44 +2771,64 @@ fn draw_nodes(
             Constraint::Length(9),
             Constraint::Length(11),
             Constraint::Min(18),
-            Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(23),
+            Constraint::Length(23),
         ],
     )
     .header(table_header([
-        "节点",
+        "主机",
         "管理",
         "运行",
         "Agent",
-        "发布地址",
-        "CPU",
-        "内存",
+        "主机地址",
+        "网卡实时",
+        "网卡累计",
     ]))
     .column_spacing(1)
-    .block(panel_block("节点清单"));
+    .block(panel_block("主机清单"));
     frame.render_widget(table, areas[1]);
 
     let detail = snapshot.nodes.get(selected_node).map_or_else(
-        || "尚未创建节点".to_string(),
+        || "尚未添加主机".to_string(),
         |node| {
+            let nic_line = snapshot
+                .host_nic
+                .iter()
+                .find(|nic| nic.node_id == node.id)
+                .map_or_else(
+                    || "暂无网卡数据".into(),
+                    |nic| {
+                        format!(
+                            "网卡 RX {}  TX {}  采样 {}",
+                            format_bytes(nic.rx_bytes),
+                            format_bytes(nic.tx_bytes),
+                            nic.sampled_at
+                        )
+                    },
+                );
             format!(
-                "ID: {}\n版本: Agent {}  Xray {}  配置修订 {}\n负载: {}  磁盘: {}  安全: {}\n落地: {}:{}",
+                "ID: {}\n版本: Agent {}  Xray {}  配置修订 {}\n负载: {}  磁盘: {}\n地址: {}  {}",
                 node.id,
                 node.agent_version.as_deref().unwrap_or("-"),
                 node.xray_version.as_deref().unwrap_or("-"),
                 node.desired_revision,
-                node.load_1_milli.map_or_else(|| "-".into(), |value| format!("{:.2}", value as f64 / 1000.0)),
-                resource_label(node.disk_used_bytes.unwrap_or_default(), node.disk_total_bytes.unwrap_or_default()),
-                node.security,
+                node.load_1_milli.map_or_else(
+                    || "-".into(),
+                    |value| format!("{:.2}", value as f64 / 1000.0)
+                ),
+                resource_label(
+                    node.disk_used_bytes.unwrap_or_default(),
+                    node.disk_total_bytes.unwrap_or_default()
+                ),
                 node.landing_host,
-                node.xray_listen_port,
+                nic_line,
             )
         },
     );
     frame.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: true })
-            .block(panel_block("选中节点")),
+            .block(panel_block("选中主机")),
         areas[2],
     );
 }
@@ -2402,82 +2895,12 @@ fn notice_color(notice: &str) -> Color {
     }
 }
 
-fn draw_metric_gauge(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    title: &str,
-    used: i64,
-    total: i64,
-    label: String,
-) {
-    let ratio = if total > 0 {
-        used.max(0).min(total) as f64 / total as f64
-    } else {
-        0.0
-    };
-    frame.render_widget(
-        Gauge::default()
-            .block(panel_block(title))
-            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
-            .ratio(ratio)
-            .label(label),
-        area,
-    );
-}
-
-fn draw_count_metric(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    title: &str,
-    count: usize,
-    detail: String,
-) {
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                count.to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
-        ])
-        .alignment(Alignment::Center)
-        .block(panel_block(title)),
-        area,
-    );
-}
-
 fn resource_label(used: i64, total: i64) -> String {
     if total > 0 {
         format!("{} / {}", format_bytes(used), format_bytes(total))
     } else {
         "暂无数据".into()
     }
-}
-
-fn resource_percent(used: Option<i64>, total: Option<i64>) -> String {
-    match (used, total) {
-        (Some(used), Some(total)) if total > 0 => {
-            format!("{:.1}%", used.max(0) as f64 / total as f64 * 100.0)
-        }
-        _ => "-".into(),
-    }
-}
-
-fn format_cpu(value: Option<i64>) -> String {
-    value.map_or_else(
-        || "-".into(),
-        |value| format!("{:.1}%", value as f64 / 100.0),
-    )
-}
-
-fn published_endpoint(node: &models::NodeOverview) -> String {
-    format!(
-        "{}:{}",
-        node.publish_host.as_deref().unwrap_or(&node.landing_host),
-        node.publish_port.unwrap_or(node.xray_listen_port)
-    )
 }
 
 fn usage_bar(value: i64, max: i64, width: usize) -> String {
@@ -2490,35 +2913,35 @@ fn usage_bar(value: i64, max: i64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-fn draw_node_edit(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, node_id: &str) {
-    draw_node_form(
+fn draw_host_edit(frame: &mut ratatui::Frame<'_>, form: &HostFormState, node_id: &str) {
+    draw_host_form(
         frame,
         form,
-        &format!("编辑节点 {}", truncate(node_id, 16)),
+        &format!("编辑主机 {}", truncate(node_id, 16)),
         "保存",
     );
 }
 
-fn draw_node_delete_confirm(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: &str) {
+fn draw_host_delete_confirm(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: &str) {
     let body = vec![
-        Line::from(format!("逻辑删除节点 {node_id}？")),
+        Line::from(format!("逻辑删除主机 {node_id}？")),
         Line::default(),
-        Line::from("需先移除活跃订阅和网卡绑定引用。"),
-        Line::from("该节点的 Agent 证书将被吊销。"),
+        Line::from("需先移除该主机节点的活跃订阅和网卡绑定。"),
+        Line::from("该主机的 Agent 证书将被吊销。"),
         Line::default(),
         Line::from(Span::styled(
             snapshot.notice.clone(),
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    let inner = modal_area(frame, 64, 10, "删除节点", true);
+    let inner = modal_area(frame, 64, 10, "删除主机", true);
     modal_body_and_hint(frame, inner, body, "[Enter] 确认  [Esc] 取消");
 }
 
 fn draw_revoke(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: &str) {
     let mut body = vec![
         Line::from(vec![
-            Span::raw("节点 ID: "),
+            Span::raw("主机 ID: "),
             Span::styled(
                 node_id.to_string(),
                 Style::default().fg(Color::Black).bg(Color::Cyan),
@@ -2526,7 +2949,7 @@ fn draw_revoke(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: 
         ]),
         Line::default(),
         Line::from(Span::styled(
-            "已注册节点:",
+            "已注册主机:",
             Style::default().fg(Color::Yellow),
         )),
     ];
@@ -2852,12 +3275,15 @@ fn draw_create(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, form: &Fo
         Style::default().fg(Color::Yellow),
     )));
     for node in snapshot
-        .nodes
+        .proxy_nodes
         .iter()
-        .filter(|node| node.management_status == "active")
+        .filter(|node| node.status == "active")
         .take(5)
     {
-        body.push(Line::from(format!("  {} ({})", node.id, node.name)));
+        body.push(Line::from(format!(
+            "  {} ({} / {})",
+            node.id, node.name, node.host_name
+        )));
     }
     body.push(Line::from(Span::styled(
         "已上报网卡:",
@@ -2878,36 +3304,108 @@ fn draw_create(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, form: &Fo
     );
 }
 
-fn draw_node_create(frame: &mut ratatui::Frame<'_>, form: &NodeFormState) {
-    draw_node_form(frame, form, "添加节点", "创建");
+fn draw_host_create(frame: &mut ratatui::Frame<'_>, form: &HostFormState) {
+    draw_host_form(frame, form, "添加主机", "创建并生成 Agent 安装命令");
 }
 
-fn draw_node_form(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, title: &str, action: &str) {
-    let labels = [
-        "节点名称 *必填",
-        "落地机地址/IP *必填",
-        "Xray 监听端口",
-        "中转发布地址 (可选)",
-        "中转发布端口 (可选)",
-        "安全类型 (none/tls/reality)",
-        "TLS/Reality server name",
-        "Reality 公钥",
-        "Reality short ID",
-        "Reality 指纹",
-    ];
-    let mut body = form_lines(&labels, &form.fields, form.active);
-    body.push(Line::default());
-    body.push(Line::from(Span::styled(
-        "Reality 私钥保存在被控端 agent.toml，主控只保存客户端参数",
-        Style::default().fg(Color::DarkGray),
-    )));
-    let inner = modal_area(frame, 72, 16, title, false);
+fn draw_host_form(frame: &mut ratatui::Frame<'_>, form: &HostFormState, title: &str, action: &str) {
+    let labels = ["主机名称 *必填", "主机地址/IP *必填"];
+    let body = form_lines(&labels, &form.fields, form.active);
+    let inner = modal_area(frame, 68, 8, title, false);
     modal_body_and_hint(
         frame,
         inner,
         body,
         &format!("[Tab/↑↓] 切换  [Enter] {action}  [Esc] 取消"),
     );
+}
+
+fn draw_proxy_node_create(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    form: &ProxyNodeFormState,
+) {
+    draw_proxy_node_form(frame, snapshot, form, "添加 Xray 节点", "创建");
+}
+
+fn draw_proxy_node_edit(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    form: &ProxyNodeFormState,
+    node_id: &str,
+) {
+    draw_proxy_node_form(
+        frame,
+        snapshot,
+        form,
+        &format!("编辑 Xray 节点 {}", truncate(node_id, 16)),
+        "保存",
+    );
+}
+
+fn draw_proxy_node_form(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    form: &ProxyNodeFormState,
+    title: &str,
+    action: &str,
+) {
+    let labels = [
+        "所属主机 ID",
+        "节点名称 *必填",
+        "Xray 监听端口",
+        "发布地址 (可选)",
+        "发布端口 (可选)",
+        "Server Name",
+        "WebSocket Path",
+        "VLESS Encryption",
+        "Reality 公钥",
+        "Reality short ID",
+        "Reality 指纹",
+    ];
+    let mut body = vec![Line::from(vec![
+        Span::raw("协议  "),
+        Span::styled(
+            format!("< {} >", PROXY_NODE_PROFILES[form.profile]),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ←/→ 切换", Style::default().fg(Color::DarkGray)),
+    ])];
+    body.extend(form_lines(&labels, &form.fields, form.active));
+    body.push(Line::from(Span::styled(
+        "主机: ",
+        Style::default().fg(Color::Yellow),
+    )));
+    for host in snapshot.nodes.iter().take(4) {
+        body.push(Line::from(format!("  {} ({})", host.id, host.name)));
+    }
+    body.push(Line::from(Span::styled(
+        if form.profile == 3 {
+            "SS2022 尚缺少凭据与 Agent 下发支持，当前不可创建"
+        } else {
+            "Reality 私钥只应在 Agent 端生成和保存"
+        },
+        Style::default().fg(Color::DarkGray),
+    )));
+    let inner = modal_area(frame, 78, 24, title, false);
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        &format!("[←/→] 协议  [Tab/↑↓] 字段  [Enter] {action}  [Esc] 取消"),
+    );
+}
+
+fn draw_proxy_node_delete_confirm(frame: &mut ratatui::Frame<'_>, node_id: &str) {
+    let body = vec![
+        Line::from(format!("逻辑删除 Xray 节点 {node_id}？")),
+        Line::default(),
+        Line::from("存在活跃订阅分配时不会删除。"),
+    ];
+    let inner = modal_area(frame, 64, 8, "删除 Xray 节点", true);
+    modal_body_and_hint(frame, inner, body, "[Enter] 确认  [Esc] 取消");
 }
 
 fn modal_area(
@@ -3024,9 +3522,10 @@ fn format_bytes(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_upgrade_command, create_node, create_subscription, format_bytes, format_reset_policy,
-        CreateNodeInput, CreateSubscriptionInput, FormState, NicBindingFormState, NicRateTracker,
-        NodeFormState, SubscriptionEditFormState, TuiSnapshot,
+        agent_upgrade_command, create_host, create_proxy_node, create_subscription, format_bytes,
+        format_reset_policy, CreateHostInput, CreateSubscriptionInput, FormState, HostFormState,
+        NicBindingFormState, NicRateTracker, ProxyNodeFormState, ProxyNodeInput,
+        SubscriptionEditFormState, TuiSnapshot,
     };
     use ratatui::{backend::TestBackend, style::Color, Terminal};
     use xenon_storage::{models, Database};
@@ -3079,7 +3578,8 @@ mod tests {
             fields: Default::default(),
             active: 0,
         };
-        let node_form = NodeFormState::default();
+        let host_form = HostFormState::default();
+        let proxy_node_form = ProxyNodeFormState::new(&snapshot);
         let nic_form = NicBindingFormState::from_snapshot(&snapshot, None);
         let subscription_form = SubscriptionEditFormState {
             fields: Default::default(),
@@ -3096,9 +3596,15 @@ mod tests {
                 let users = super::draw_primary_shell(frame, &snapshot, 1);
                 super::draw_users(frame, users, &snapshot, 0);
                 let nodes = super::draw_primary_shell(frame, &snapshot, 2);
-                super::draw_nodes(frame, nodes, &snapshot, 0);
-                super::draw_node_edit(frame, &node_form, "node");
-                super::draw_node_delete_confirm(frame, &snapshot, "node");
+                super::draw_proxy_nodes(frame, nodes, &snapshot, 0);
+                let hosts = super::draw_primary_shell(frame, &snapshot, 3);
+                super::draw_nodes(frame, hosts, &snapshot, 0);
+                let logs = super::draw_primary_shell(frame, &snapshot, 4);
+                super::draw_logs(frame, logs, &snapshot);
+                super::draw_host_edit(frame, &host_form, "host");
+                super::draw_host_delete_confirm(frame, &snapshot, "host");
+                super::draw_proxy_node_edit(frame, &snapshot, &proxy_node_form, "node");
+                super::draw_proxy_node_delete_confirm(frame, "node");
                 super::draw_revoke(frame, &snapshot, "node");
                 super::draw_user_detail(frame, &snapshot, 0);
                 super::draw_nic_bindings(frame, &snapshot, 0, 0);
@@ -3112,7 +3618,8 @@ mod tests {
                     super::RotateKind::Token,
                 );
                 super::draw_create(frame, &snapshot, &form);
-                super::draw_node_create(frame, &node_form);
+                super::draw_host_create(frame, &host_form);
+                super::draw_proxy_node_create(frame, &snapshot, &proxy_node_form);
             })
             .expect("small terminal render");
     }
@@ -3160,6 +3667,34 @@ mod tests {
                 disk_total_bytes: Some(20 * 1024 * 1024 * 1024),
                 disk_used_bytes: Some(5 * 1024 * 1024 * 1024),
             }],
+            proxy_nodes: vec![models::ProxyNodeRecord {
+                id: "proxy-a".into(),
+                host_id: "node-a".into(),
+                name: "Tokyo Reality".into(),
+                host_name: "Tokyo".into(),
+                landing_host: "203.0.113.10".into(),
+                listen_port: 443,
+                publish_host: Some("relay.example".into()),
+                publish_port: Some(8443),
+                protocol: "vless".into(),
+                transport: "tcp".into(),
+                security: "reality".into(),
+                server_name: Some("example.com".into()),
+                websocket_path: None,
+                vless_encryption: None,
+                reality_public_key: Some("public-key".into()),
+                reality_short_id: Some("short-id".into()),
+                reality_fingerprint: Some("chrome".into()),
+                status: "active".into(),
+            }],
+            host_nic: vec![super::HostNicSnapshot {
+                node_id: "node-a".into(),
+                rx_bytes: 8 * 1024 * 1024,
+                tx_bytes: 2 * 1024 * 1024,
+                down_rate_bps: 2048,
+                up_rate_bps: 1024,
+                sampled_at: 100,
+            }],
             ..TuiSnapshot::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
@@ -3173,7 +3708,7 @@ mod tests {
         let dashboard = rendered_text(&terminal);
         let compact_dashboard = dashboard.replace(' ', "");
         assert!(compact_dashboard.contains("仪表盘[1]"), "{dashboard}");
-        assert!(compact_dashboard.contains("平均CPU"), "{dashboard}");
+        assert!(compact_dashboard.contains("CPU12.5%"), "{dashboard}");
         assert!(compact_dashboard.contains("用量Top5"), "{dashboard}");
         assert!(compact_dashboard.contains("用户摘要"), "{dashboard}");
         assert!(dashboard.contains("admin"), "{dashboard}");
@@ -3201,15 +3736,29 @@ mod tests {
         node_terminal
             .draw(|frame| {
                 let area = super::draw_primary_shell(frame, &snapshot, 2);
-                super::draw_nodes(frame, area, &snapshot, 0);
+                super::draw_proxy_nodes(frame, area, &snapshot, 0);
             })
             .expect("nodes render");
         let nodes = rendered_text(&node_terminal);
         let compact_nodes = nodes.replace(' ', "");
         assert!(compact_nodes.contains("节点[3]"), "{nodes}");
-        assert!(compact_nodes.contains("节点清单"), "{nodes}");
+        assert!(compact_nodes.contains("Xray节点"), "{nodes}");
         assert!(compact_nodes.contains("选中节点"), "{nodes}");
-        assert!(nodes.contains("26.6.27"), "{nodes}");
+        assert!(nodes.contains("Tokyo Reality"), "{nodes}");
+
+        let mut host_terminal = Terminal::new(TestBackend::new(140, 36)).expect("test terminal");
+        host_terminal
+            .draw(|frame| {
+                let area = super::draw_primary_shell(frame, &snapshot, 3);
+                super::draw_nodes(frame, area, &snapshot, 0);
+            })
+            .expect("hosts render");
+        let hosts = rendered_text(&host_terminal);
+        let compact_hosts = hosts.replace(' ', "");
+        assert!(compact_hosts.contains("主机资源"), "{hosts}");
+        assert!(compact_hosts.contains("网卡实时"), "{hosts}");
+        assert!(compact_hosts.contains("↓2.0KiB/s↑1.0KiB/s"), "{hosts}");
+        assert!(compact_hosts.contains("↓8.0MiB↑2.0MiB"), "{hosts}");
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
@@ -3293,7 +3842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_node_and_registration_token_atomically() {
+    async fn creates_host_and_registration_token_without_a_protocol_node() {
         let temp = tempfile::tempdir().expect("temp dir");
         let database = Database::connect(temp.path().join("panel.db"))
             .await
@@ -3312,21 +3861,13 @@ mod tests {
             enrollment_endpoint: "https://panel.test:50052".into(),
             server_name: "panel.test".into(),
         };
-        let notice = create_node(
+        let notice = create_host(
             &database,
             "127.0.0.1:50051",
             &install,
-            CreateNodeInput {
+            CreateHostInput {
                 name: "Node A".into(),
                 landing_host: "203.0.113.10".into(),
-                xray_port: "443".into(),
-                publish_host: "relay.example".into(),
-                publish_port: "8443".into(),
-                security: "none".into(),
-                server_name: String::new(),
-                reality_public_key: String::new(),
-                reality_short_id: String::new(),
-                reality_fingerprint: String::new(),
             },
         )
         .await
@@ -3340,10 +3881,58 @@ mod tests {
         assert!(upgrade.contains("--rollback"));
         assert!(upgrade.contains("--agent-version '0.1.0'"));
         assert_eq!(database.list_nodes().await.expect("nodes").len(), 1);
+        assert!(database
+            .list_proxy_nodes()
+            .await
+            .expect("proxy nodes")
+            .is_empty());
         let token_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM registration_tokens")
             .fetch_one(database.pool())
             .await
             .expect("tokens");
         assert_eq!(token_count, 1);
+    }
+
+    #[tokio::test]
+    async fn creates_protocol_node_on_an_existing_host() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database = Database::connect(temp.path().join("panel.db"))
+            .await
+            .expect("database");
+        database
+            .ensure_development_node("host-a", 1)
+            .await
+            .expect("host");
+
+        let notice = create_proxy_node(
+            &database,
+            ProxyNodeInput {
+                host_id: "host-a".into(),
+                name: "WS 8443".into(),
+                profile: "vless-ws".into(),
+                listen_port: "8443".into(),
+                publish_host: "edge.example.com".into(),
+                publish_port: "443".into(),
+                server_name: String::new(),
+                websocket_path: "/xray".into(),
+                vless_encryption: String::new(),
+                reality_public_key: String::new(),
+                reality_short_id: String::new(),
+                reality_fingerprint: "chrome".into(),
+            },
+        )
+        .await
+        .expect("create protocol node");
+
+        assert!(notice.contains("Agent multi-inbound deployment is pending"));
+        let nodes = database.list_proxy_nodes().await.expect("proxy nodes");
+        let node = nodes
+            .iter()
+            .find(|node| node.name == "WS 8443")
+            .expect("created protocol node");
+        assert_eq!(node.host_id, "host-a");
+        assert_eq!(node.transport, "ws");
+        assert_eq!(node.websocket_path.as_deref(), Some("/xray"));
+        assert_eq!(node.status, "disabled");
     }
 }

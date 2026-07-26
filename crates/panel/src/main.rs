@@ -17,6 +17,17 @@ use tracing::info;
 pub struct RuntimeState {
     pub connected_agents: usize,
     pub last_agent_event: Option<String>,
+    pub agent_events: std::collections::VecDeque<String>,
+}
+
+impl RuntimeState {
+    pub fn record_agent_event(&mut self, event: String) {
+        self.last_agent_event = Some(event.clone());
+        self.agent_events.push_back(event);
+        while self.agent_events.len() > 200 {
+            self.agent_events.pop_front();
+        }
+    }
 }
 
 enum Command {

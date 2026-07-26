@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::RwLock};
 use url::Url;
-use xenon_storage::{models::NodeRecord, Database};
+use xenon_storage::{models::ProxyNodeRecord, Database};
 
 #[derive(Clone)]
 struct HttpState {
@@ -166,7 +166,7 @@ async fn subscription_response_by_hash(
     if record.starts_at > now || record.expires_at.is_some_and(|expires| expires <= now) {
         return not_found();
     }
-    let nodes = match state.database.subscription_nodes(&record.id).await {
+    let nodes = match state.database.subscription_proxy_nodes(&record.id).await {
         Ok(nodes) if !nodes.is_empty() => nodes,
         Ok(_) => {
             return (
@@ -297,6 +297,8 @@ struct ClientNode {
     uuid: String,
     transport: String,
     security: String,
+    websocket_path: Option<String>,
+    vless_encryption: Option<String>,
     server_name: Option<String>,
     reality_public_key: Option<String>,
     reality_short_id: Option<String>,
@@ -304,17 +306,19 @@ struct ClientNode {
 }
 
 impl ClientNode {
-    fn from_record(node: &NodeRecord, uuid: &str) -> Self {
+    fn from_record(node: &ProxyNodeRecord, uuid: &str) -> Self {
         Self {
             name: node.name.clone(),
             server: node
                 .publish_host
                 .clone()
                 .unwrap_or_else(|| node.landing_host.clone()),
-            port: node.publish_port.unwrap_or(node.xray_listen_port) as u16,
+            port: node.publish_port.unwrap_or(node.listen_port) as u16,
             uuid: uuid.to_string(),
             transport: node.transport.clone(),
             security: node.security.clone(),
+            websocket_path: node.websocket_path.clone(),
+            vless_encryption: node.vless_encryption.clone(),
             server_name: node.server_name.clone(),
             reality_public_key: node.reality_public_key.clone(),
             reality_short_id: node.reality_short_id.clone(),
@@ -497,9 +501,17 @@ fn vless_link(node: &ClientNode) -> anyhow::Result<String> {
     };
     let mut url = Url::parse(&format!("vless://{}@{host}:{}", node.uuid, node.port))?;
     url.query_pairs_mut()
-        .append_pair("encryption", "none")
+        .append_pair(
+            "encryption",
+            node.vless_encryption.as_deref().unwrap_or("none"),
+        )
         .append_pair("type", &node.transport)
         .append_pair("security", &node.security);
+    if node.transport == "ws" {
+        if let Some(path) = &node.websocket_path {
+            url.query_pairs_mut().append_pair("path", path);
+        }
+    }
     if let Some(server_name) = &node.server_name {
         url.query_pairs_mut().append_pair("sni", server_name);
     }
@@ -572,8 +584,10 @@ mod tests {
             server: "relay.example.com".into(),
             port: 8443,
             uuid: "01900000-0000-7000-8000-000000000001".into(),
-            transport: "tcp".into(),
+            transport: "ws".into(),
             security: "none".into(),
+            websocket_path: Some("/xray".into()),
+            vless_encryption: Some("test-encryption".into()),
             server_name: None,
             reality_public_key: None,
             reality_short_id: None,
@@ -583,6 +597,8 @@ mod tests {
             .expect("vless output");
         let link = String::from_utf8(STANDARD.decode(link).expect("base64")).expect("text");
         assert!(link.contains("@relay.example.com:8443"));
+        assert!(link.contains("encryption=test-encryption"));
+        assert!(link.contains("path=%2Fxray"));
         assert!(link.ends_with("#Hong%20Kong%2001"));
         let mihomo = render_subscription(SubscriptionFormat::Mihomo, std::slice::from_ref(&node))
             .expect("mihomo output");
@@ -597,6 +613,8 @@ mod tests {
             uuid: "01900000-0000-7000-8000-000000000002".into(),
             transport: "tcp".into(),
             security: "reality".into(),
+            websocket_path: None,
+            vless_encryption: None,
             server_name: Some("www.example.com".into()),
             reality_public_key: Some("public-key".into()),
             reality_short_id: Some("short".into()),
@@ -637,6 +655,13 @@ mod tests {
         .execute(database.pool())
         .await
         .expect("update node");
+        sqlx::query(
+            "UPDATE proxy_nodes SET name = 'Relay Node', publish_host = 'relay.example.com',
+             publish_port = 8443 WHERE id = 'node-a'",
+        )
+        .execute(database.pool())
+        .await
+        .expect("update proxy node");
         database
             .create_user_subscription(&NewSubscription {
                 user_id: "user-a".into(),

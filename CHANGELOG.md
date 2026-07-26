@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.0-alpha.8 - 2026-07-26
+
+### Added
+
+- Separate Xray protocol-node records and subscription assignments, allowing multiple protocol nodes to belong to one managed Agent host.
+- Dedicated host and Agent event pages, plus per-host NIC rates and cumulative RX/TX counters.
+
+### Changed
+
+- TUI now has 仪表盘/用户/节点/主机/日志 tabs with separate CRUD flows for Xray protocol nodes and managed Agent hosts.
+- New protocol nodes remain disabled until Agent multi-inbound deployment is implemented; existing single-inbound nodes are migrated without changing IDs or subscription assignments.
+
+### Fixed
+
+- Include VLESS WebSocket paths and VLESS Encryption values in generated VLESS subscription links.
+
+### Known limitations
+
+- Agent reconciliation still manages one local VLESS inbound. Multi-inbound deployment, Agent-side Reality key generation, per-protocol-node Xray identities, and SS2022 credentials remain pending.
+
 ## 0.1.0-alpha.7 - 2026-07-26
 
 ### Added

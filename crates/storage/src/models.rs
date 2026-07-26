@@ -17,6 +17,14 @@ pub struct NicCounterTotals {
     pub sampled_at: i64,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NodeNicCounterTotals {
+    pub node_id: String,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+    pub sampled_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserNodeUsage {
     pub subscription_id: String,
@@ -26,6 +34,12 @@ pub struct UserNodeUsage {
     pub uplink_bytes: i64,
     pub downlink_bytes: i64,
     pub charged_bytes: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SubscriptionProxyNode {
+    pub subscription_id: String,
+    pub proxy_node_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +111,7 @@ pub struct NicBindingRecord {
 pub struct UserDetail {
     pub user: UserSummary,
     pub subscriptions: Vec<SubscriptionRecord>,
+    pub proxy_nodes: Vec<SubscriptionProxyNode>,
     pub node_usage: Vec<UserNodeUsage>,
     pub nic_usage: Vec<SubscriptionNicUsage>,
     pub nic_bindings: Vec<NicBindingRecord>,
@@ -188,6 +203,67 @@ pub struct NodeRecord {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyNodeRecord {
+    pub id: String,
+    pub host_id: String,
+    pub name: String,
+    pub host_name: String,
+    pub landing_host: String,
+    pub listen_port: i64,
+    pub publish_host: Option<String>,
+    pub publish_port: Option<i64>,
+    pub protocol: String,
+    pub transport: String,
+    pub security: String,
+    pub server_name: Option<String>,
+    pub websocket_path: Option<String>,
+    pub vless_encryption: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub reality_fingerprint: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewProxyNode {
+    pub id: String,
+    pub host_id: String,
+    pub name: String,
+    pub listen_port: i64,
+    pub publish_host: Option<String>,
+    pub publish_port: Option<i64>,
+    pub protocol: String,
+    pub transport: String,
+    pub security: String,
+    pub server_name: Option<String>,
+    pub websocket_path: Option<String>,
+    pub vless_encryption: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub reality_fingerprint: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateProxyNode {
+    pub host_id: String,
+    pub name: String,
+    pub listen_port: i64,
+    pub publish_host: Option<String>,
+    pub publish_port: Option<i64>,
+    pub protocol: String,
+    pub transport: String,
+    pub security: String,
+    pub server_name: Option<String>,
+    pub websocket_path: Option<String>,
+    pub vless_encryption: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub reality_fingerprint: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NodeOverview {
     pub id: String,
     pub name: String,
@@ -264,6 +340,21 @@ pub struct NewNode {
     pub reality_short_id: Option<String>,
     pub reality_fingerprint: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManagedHost {
+    pub id: String,
+    pub name: String,
+    pub landing_host: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateManagedHost {
+    pub name: String,
+    pub landing_host: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]

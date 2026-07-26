@@ -7,8 +7,9 @@ Xenon 是使用 Rust 开发的纯 TUI 多节点 Xray 管理系统，由主控和
 当前为可运行的 Panel/Agent 纵向功能骨架：
 
 - Cargo workspace 已拆分为 `domain`、`protocol`、`storage`、`xray-protocol`、`xray-runner`、`panel`、`agent`。
-- Panel 可初始化 SQLite、启动带首帧注册校验的 gRPC 服务、只读多格式订阅服务和 TUI 创建向导。
-- 节点向导支持 VLESS TCP 的 `none`、TLS、Reality 客户端参数；Reality 私钥不进入 Panel 订阅数据。
+- Panel 可初始化 SQLite、启动带首帧注册校验的 gRPC 服务、只读多格式订阅服务和五页 TUI 管理界面。
+- TUI 已将“主机”和“节点”拆开：主机代表 VPS 与 Agent，协议节点绑定到已有主机；一个主机可保存多个 VLESS Reality、VLESS Encryption 或 VLESS WS 节点配置。
+- 新协议节点在 Agent 多入站下发完成前默认保存为禁用；Reality 私钥不进入 Panel 数据。SS2022 入口仅展示规划状态，当前不会创建不完整配置。
 - Agent 可读取配置、建立 gRPC 双向流、周期发送心跳和真实 Linux 网卡绝对计数器，并通过 Xray API 动态同步用户。
 - Agent 同时上报 CPU 使用率、1/5/15 分钟负载、内存和磁盘用量，Panel TUI 显示最新节点系统指标。
 - Agent 默认根据结构化 Xray 配置生成最小服务端 JSON；可选 TLS/Reality，完整 JSON 仅作为高级覆盖项。
@@ -50,7 +51,7 @@ Copy-Item agent.toml.example agent.toml
 cargo run -p xenon-agent
 ```
 
-Panel TUI 顶部使用 `Tab` 或数字键 `1`/`2` 在总览和节点页间切换。总览页以真实节点数据展示 CPU、内存和磁盘仪表，并按 Xray 当前周期计费流量排列用户；`Up/Down` 选择用户、`Enter` 查看订阅和各节点明细，`c` 创建用户与订阅，`n` 创建节点并生成一次性 Agent 安装命令。节点页支持 `e` 或 `Enter` 编辑、`d` 启用或禁用、`u` 显示升级/回滚命令、`r` 吊销 Agent 证书、大写 `D` 确认逻辑删除、`n` 新建节点。用户详情页使用 `e` 编辑所选订阅的节点、额度、倍率、周期、到期时间和状态，`T` 轮换订阅 Token，`U` 轮换 Xray UUID，使用 `b` 或 `Enter` 管理网卡绑定，大写 `R` 立即重置订阅周期；网卡页支持 `a` 新增、`R` 重置、`D` 确认解绑。`q` 或 `Esc` 退出。健康检查：
+Panel TUI 顶部使用数字键 `1` 到 `5` 或 `Tab` 在“仪表盘 / 用户 / 节点 / 主机 / 日志”间切换。主机页的 `n` 创建 VPS/Agent 身份并生成一次性安装命令，`e` 编辑主机名称和地址，`u` 显示升级/回滚命令，`r` 吊销 Agent 证书。节点页的 `n` 在已有主机上保存协议节点，表单内用左右键切换协议类型，`e` 编辑、`d` 启停、大写 `D` 逻辑删除。总览和用户主页始终展示 Xray 流量；网卡绑定只决定 `subscription-userinfo` 的流量来源。用户详情页可编辑订阅节点、额度、倍率、周期、到期时间和状态，并管理网卡绑定与凭据轮换。`q` 退出。健康检查：
 
 ```text
 GET http://127.0.0.1:18181/healthz
@@ -162,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-pa
 
 安装器会下载最新 Release、生成自签服务端 CA/证书与 Agent 客户端 CA、写入启用 mTLS 和 Enrollment 的 `/etc/xenon/xenon.toml`，并以 systemd 服务启动主控。有域名时用 `sudo XENON_HOST=panel.example.com bash` 指定；否则自动使用公网 IPv4。
 
-装好后执行 `sudo xenon-tui` 进入 TUI，按 `n` 创建节点，把打印的一行命令拷贝到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA，Agent 注册后节点自动上线。
+装好后执行 `sudo xenon-tui` 进入 TUI，切换到“主机 [4]”并按 `n` 创建主机，把打印的一行命令拷贝到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA。Agent 注册上线后，再到“节点 [3]”为该主机配置协议节点。
 
 需要放行端口：`50051`（gRPC mTLS）、`50052`（Enrollment）、`18181`（订阅 HTTP）以及各节点的 Xray 端口。
 

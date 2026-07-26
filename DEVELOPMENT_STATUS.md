@@ -6,7 +6,7 @@
 
 Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管理节点、用户和订阅，Agent 在 Linux 上以内嵌 Xray-core `26.6.27` 提供节点能力。主控不保存 SSH 密码，中转只保存客户端发布地址和端口，不负责中转服务器转发配置。
 
-当前版本为 `0.1.0-alpha.7`。它已经具备完整纵向功能和 Windows 开发环境自动测试，但尚未完成真实 Linux 生产环境的全部验收，因此当前结论是：
+当前版本为 `0.1.0-alpha.8`。它已经具备完整纵向功能和 Windows 开发环境自动测试，但尚未完成真实 Linux 生产环境的全部验收，因此当前结论是：
 
 - 可以用于本地体验、功能联调和隔离测试环境。
 - 可以在自有 Linux 测试 VPS 上进行试运行。
@@ -18,12 +18,14 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 
 - SQLite 单文件数据库、WAL、迁移、计费周期和流量聚合。
 - TUI 创建用户与订阅、选择多个节点、额度、到期、重置周期和单双倍计费。
-- TUI 总览和节点页提供统一页签、固定状态栏、真实资源仪表、用户流量排行和结构化节点清单。
-- TUI 采用 仪表盘/用户/节点 三页签，表单和确认操作使用居中弹窗，固定状态栏提示各页按键。
+- TUI 采用“仪表盘 / 用户 / 节点 / 主机 / 日志”五页签，表单和确认操作使用居中弹窗，固定状态栏提示各页按键。
+- 主机与协议节点已拆分：主机保存 VPS/Agent 身份和系统指标，协议节点绑定主机；一个主机可保存多个协议节点。
+- 主机页在单行资源摘要下按主机显示网卡实时上下行速率和累计 RX/TX 计数。
 - TUI 总览提供全节点上/下行实时速率曲线、用户启用/超额/到期摘要和额度百分比。
 - 用户首页按 Xray 当前周期计费流量排序，详情显示订阅和节点流量。
 - 网卡绑定独立于用户 Xray 统计，只切换 `subscription-userinfo` 的计费来源。
-- 节点创建、编辑、启停、证书吊销、逻辑删除和 Agent 安装/升级命令。
+- 主机创建、编辑、启停、证书吊销、逻辑删除和 Agent 安装/升级命令；协议节点支持独立创建、编辑、启停和逻辑删除。
+- 协议节点表单已覆盖 VLESS Reality、VLESS Encryption、VLESS WS 的管理字段；新节点在 Agent 多入站下发完成前默认禁用。SS2022 凭据模型和下发尚未实现。
 - `scripts/install-panel.sh` 正式主控一键安装：自动取最新 Release、生成自签 CA/证书、写入 mTLS+Enrollment 配置并启动 systemd 服务；TUI 生成的被控安装命令自适应架构并内嵌主控 CA。
 - VLESS Base64、Mihomo YAML 和 Sing-box JSON 订阅输出。
 - 订阅 HTTPS、IP/Token 双限流和脱敏日志。
@@ -42,7 +44,7 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 
 ### 当前自动验证
 
-- Workspace 38 项测试通过。
+- Workspace 41 项测试通过。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过。
 - TUI 所有主要页面通过 `24x4` 小终端无终端渲染测试。
@@ -51,7 +53,7 @@ Xenon 是 Rust 编写的多节点 Xray 管理系统：主控使用终端 TUI 管
 
 ## 3. 尚未完成的生产准入项
 
-以下项目完成前，不应把 `0.1.0-alpha.7` 标为 production-ready：
+以下项目完成前，不应把 `0.1.0-alpha.8` 标为 production-ready：
 
 1. 在目标 Linux 发行版执行 `scripts/linux-e2e.sh`，验证真实 Xray、memfd、崩溃重启、父进程回收和网卡计数器。
 2. 使用 systemd 安装脚本进行安装、重启、升级失败自动回滚和人工回滚演练。
@@ -101,12 +103,13 @@ Linux release 构建在缺少内核、版本不等于 `26.6.27` 或摘要不一�
 
 1. 在 Panel 主机准备正式服务端证书、独立 Agent 客户端 CA 和 HTTPS 订阅域名。
 2. 从 `xenon.toml.example` 生成私有 `xenon.toml`，启用 `[tls]`、`[enrollment]`、`[subscription_http]`、`[backup]` 和 `[agent_install]`。
-3. 启动 Panel，在 TUI 创建节点并取得一次性安装命令。
+3. 启动 Panel，在 TUI 主机页创建主机并取得一次性安装命令。
 4. 在目标 Linux VPS 以 root 执行安装命令，安装器创建受限用户和 systemd 服务。
-5. 在节点页确认 Agent、Xray、修订同步和系统指标正常。
-6. 创建测试用户与订阅，选择节点和额度；需要商家网卡参考值时再绑定对应网卡。
-7. 分别验证 VLESS、Mihomo、Sing-box 客户端订阅和 `subscription-userinfo`。
-8. 演练 Xray kill、Agent 重启、Panel 重启、证书吊销和备份恢复后再扩大使用范围。
+5. 在主机页确认 Agent、Xray、修订同步和系统指标正常。
+6. 在节点页为主机配置协议节点；当前只应继续使用与 Agent 本地单入站配置一致的兼容节点。
+7. 创建测试用户与订阅，选择节点和额度；需要商家网卡参考值时再绑定对应网卡。
+8. 分别验证 VLESS、Mihomo、Sing-box 客户端订阅和 `subscription-userinfo`。
+9. 演练 Xray kill、Agent 重启、Panel 重启、证书吊销和备份恢复后再扩大使用范围。
 
 详细配置、按键和运维命令见 `README.md`，完整业务规则和验收标准见 `PROJECT_SPEC.md`。
 
@@ -155,6 +158,8 @@ git push -u origin main
 
 ### P2：管理体验
 
+- 扩展 Panel/Agent 协议并完成多 Xray 入站生成、应用状态 ACK、Reality 密钥在 Agent 端生成，以及 SS2022 凭据下发。
+- 为每个订阅/协议节点生成唯一 Xray 统计身份，实现同一主机多入站的精确节点流量。
 - 可选套餐模板，创建订阅时复制策略快照，模板更新不隐式修改旧订阅。
 - 将 TUI 按键状态迁移到独立 reducer，增加后台刷新期间的选择和表单保持测试。
 - 增加节点、用户、证书和备份的诊断/审计视图。

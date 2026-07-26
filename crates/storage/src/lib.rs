@@ -323,6 +323,30 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
+            "INSERT INTO proxy_nodes
+                (id, host_id, name, protocol, transport, security, listen_port,
+                 publish_host, publish_port, server_name, reality_public_key,
+                 reality_short_id, reality_fingerprint, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        )
+        .bind(&node.id)
+        .bind(&node.id)
+        .bind(&node.name)
+        .bind(&node.protocol)
+        .bind(&node.transport)
+        .bind(&node.security)
+        .bind(node.xray_listen_port)
+        .bind(&node.publish_host)
+        .bind(node.publish_port)
+        .bind(&node.server_name)
+        .bind(&node.reality_public_key)
+        .bind(&node.reality_short_id)
+        .bind(&node.reality_fingerprint)
+        .bind(node.created_at)
+        .bind(node.created_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "INSERT INTO registration_tokens
                 (id, node_id, token_hash, expires_at, created_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -338,6 +362,68 @@ impl Database {
         Ok(())
     }
 
+    pub async fn create_managed_host_with_registration(
+        &self,
+        host: &models::NewManagedHost,
+        registration: &models::NewRegistrationToken,
+    ) -> Result<(), StorageError> {
+        validate_managed_host(&host.id, &host.name, &host.landing_host)?;
+        if registration.node_id != host.id || registration.expires_at <= registration.created_at {
+            return Err(StorageError::Validation(
+                "invalid host registration token".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        // Protocol columns remain populated until the legacy nodes table can be
+        // replaced by a dedicated managed_hosts table.
+        sqlx::query(
+            "INSERT INTO nodes
+                (id, name, landing_host, xray_listen_port, protocol, transport,
+                 security, status, created_at, updated_at)
+             VALUES (?, ?, ?, 443, 'vless', 'tcp', 'none', 'pending', ?, ?)",
+        )
+        .bind(&host.id)
+        .bind(host.name.trim())
+        .bind(host.landing_host.trim())
+        .bind(host.created_at)
+        .bind(host.created_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO registration_tokens
+                (id, node_id, token_hash, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&registration.id)
+        .bind(&registration.node_id)
+        .bind(&registration.token_hash)
+        .bind(registration.expires_at)
+        .bind(registration.created_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_managed_host(
+        &self,
+        host_id: &str,
+        host: &models::UpdateManagedHost,
+    ) -> Result<bool, StorageError> {
+        validate_managed_host(host_id, &host.name, &host.landing_host)?;
+        let result = sqlx::query(
+            "UPDATE nodes SET name = ?, landing_host = ?, updated_at = ?
+             WHERE id = ? AND management_status != 'deleted'",
+        )
+        .bind(host.name.trim())
+        .bind(host.landing_host.trim())
+        .bind(host.updated_at)
+        .bind(host_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn create_user_subscription(
         &self,
         input: &models::NewSubscription,
@@ -348,12 +434,6 @@ impl Database {
             ));
         }
         for binding in &input.nic_bindings {
-            if !input.node_ids.contains(&binding.node_id) {
-                return Err(StorageError::Validation(format!(
-                    "NIC binding node is not selected: {}",
-                    binding.node_id
-                )));
-            }
             if binding.interface_name.trim().is_empty()
                 || binding.traffic_limit_bytes <= 0
                 || binding.initial_used_bytes < 0
@@ -420,14 +500,39 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
-        for (sort_order, node_id) in input.node_ids.iter().enumerate() {
+        for (sort_order, proxy_node_id) in input.node_ids.iter().enumerate() {
+            let host_id = sqlx::query_scalar::<_, String>(
+                "SELECT p.host_id
+                 FROM proxy_nodes p
+                 INNER JOIN nodes h ON h.id = p.host_id
+                 WHERE p.id = ? AND p.status = 'active'
+                   AND h.management_status = 'active'",
+            )
+            .bind(proxy_node_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Validation(format!("unknown or disabled Xray node: {proxy_node_id}"))
+            })?;
             sqlx::query(
-                "INSERT INTO subscription_nodes
-                    (subscription_id, node_id, enabled, sort_order)
+                "INSERT INTO subscription_proxy_nodes
+                    (subscription_id, proxy_node_id, enabled, sort_order)
                  VALUES (?, ?, 1, ?)",
             )
             .bind(&input.subscription_id)
-            .bind(node_id)
+            .bind(proxy_node_id)
+            .bind(sort_order as i64)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO subscription_nodes
+                    (subscription_id, node_id, enabled, sort_order)
+                 VALUES (?, ?, 1, ?)
+                 ON CONFLICT(subscription_id, node_id) DO UPDATE SET
+                    enabled = 1, sort_order = MIN(sort_order, excluded.sort_order)",
+            )
+            .bind(&input.subscription_id)
+            .bind(&host_id)
             .bind(sort_order as i64)
             .execute(&mut *tx)
             .await?;
@@ -437,7 +542,7 @@ impl Database {
                  WHERE id = ?",
             )
             .bind(input.created_at)
-            .bind(node_id)
+            .bind(&host_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -530,52 +635,35 @@ impl Database {
                 "invalid subscription period".into(),
             ));
         }
-        for node_id in &input.node_ids {
-            let exists = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(
-                    SELECT 1 FROM nodes
-                    WHERE id = ? AND management_status = 'active'
-                )",
+        let mut new_hosts = HashSet::new();
+        for proxy_node_id in &input.node_ids {
+            let host_id = sqlx::query_scalar::<_, String>(
+                "SELECT p.host_id
+                 FROM proxy_nodes p
+                 INNER JOIN nodes h ON h.id = p.host_id
+                 WHERE p.id = ? AND p.status = 'active'
+                   AND h.management_status = 'active'",
             )
-            .bind(node_id)
-            .fetch_one(&mut *tx)
+            .bind(proxy_node_id)
+            .fetch_optional(&mut *tx)
             .await?;
-            if exists != 1 {
+            let Some(host_id) = host_id else {
                 tx.rollback().await?;
                 return Err(StorageError::Validation(format!(
-                    "unknown or disabled node: {node_id}"
+                    "unknown or disabled Xray node: {proxy_node_id}"
                 )));
-            }
+            };
+            new_hosts.insert(host_id);
         }
-        let old_nodes = sqlx::query_scalar::<_, String>(
-            "SELECT node_id FROM subscription_nodes
-             WHERE subscription_id = ? AND enabled = 1",
+        let old_hosts = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT p.host_id
+             FROM subscription_proxy_nodes spn
+             INNER JOIN proxy_nodes p ON p.id = spn.proxy_node_id
+             WHERE spn.subscription_id = ? AND spn.enabled = 1",
         )
         .bind(subscription_id)
         .fetch_all(&mut *tx)
         .await?;
-        for node_id in old_nodes
-            .iter()
-            .filter(|node_id| !unique_nodes.contains(node_id))
-        {
-            let has_binding = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(
-                    SELECT 1 FROM nic_bindings
-                    WHERE subscription_id = ? AND node_id = ?
-                      AND enabled = 1 AND unbound_at IS NULL
-                )",
-            )
-            .bind(subscription_id)
-            .bind(node_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if has_binding == 1 {
-                tx.rollback().await?;
-                return Err(StorageError::Validation(format!(
-                    "unbind NICs before removing node: {node_id}"
-                )));
-            }
-        }
         sqlx::query(
             "UPDATE subscriptions
              SET name = ?, status = ?, expires_at = ?, traffic_limit_bytes = ?,
@@ -599,23 +687,44 @@ impl Database {
             .bind(subscription_id)
             .execute(&mut *tx)
             .await?;
-        for (sort_order, node_id) in input.node_ids.iter().enumerate() {
+        sqlx::query("UPDATE subscription_proxy_nodes SET enabled = 0 WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .execute(&mut *tx)
+            .await?;
+        for (sort_order, proxy_node_id) in input.node_ids.iter().enumerate() {
+            let host_id =
+                sqlx::query_scalar::<_, String>("SELECT host_id FROM proxy_nodes WHERE id = ?")
+                    .bind(proxy_node_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            sqlx::query(
+                "INSERT INTO subscription_proxy_nodes
+                    (subscription_id, proxy_node_id, enabled, sort_order)
+                 VALUES (?, ?, 1, ?)
+                 ON CONFLICT(subscription_id, proxy_node_id) DO UPDATE SET
+                    enabled = 1, sort_order = excluded.sort_order",
+            )
+            .bind(subscription_id)
+            .bind(proxy_node_id)
+            .bind(sort_order as i64)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "INSERT INTO subscription_nodes
                     (subscription_id, node_id, enabled, sort_order)
                  VALUES (?, ?, 1, ?)
                  ON CONFLICT(subscription_id, node_id) DO UPDATE SET
-                    enabled = 1, sort_order = excluded.sort_order",
+                    enabled = 1, sort_order = MIN(sort_order, excluded.sort_order)",
             )
             .bind(subscription_id)
-            .bind(node_id)
+            .bind(host_id)
             .bind(sort_order as i64)
             .execute(&mut *tx)
             .await?;
         }
-        let affected_nodes = old_nodes
+        let affected_nodes = old_hosts
             .into_iter()
-            .chain(input.node_ids.iter().cloned())
+            .chain(new_hosts)
             .collect::<HashSet<_>>();
         for node_id in affected_nodes {
             sqlx::query(
@@ -905,6 +1014,30 @@ impl Database {
         }
     }
 
+    pub async fn latest_nic_totals_by_node(
+        &self,
+    ) -> Result<Vec<models::NodeNicCounterTotals>, StorageError> {
+        let totals = sqlx::query_as::<_, models::NodeNicCounterTotals>(
+            "WITH ranked AS (
+                SELECT node_id, rx_absolute, tx_absolute, sampled_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY node_id, interface_name
+                           ORDER BY sampled_at DESC, sequence DESC
+                       ) AS rn
+                FROM interface_snapshots
+             )
+             SELECT node_id, SUM(rx_absolute) AS rx_bytes,
+                    SUM(tx_absolute) AS tx_bytes, MAX(sampled_at) AS sampled_at
+             FROM ranked
+             WHERE rn = 1
+             GROUP BY node_id
+             ORDER BY node_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(totals)
+    }
+
     pub async fn list_nodes(&self) -> Result<Vec<models::NodeRecord>, StorageError> {
         let rows = sqlx::query_as::<_, models::NodeRecord>(
             "SELECT id, name, landing_host, xray_listen_port,
@@ -916,6 +1049,267 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn list_proxy_nodes(&self) -> Result<Vec<models::ProxyNodeRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, models::ProxyNodeRecord>(
+            "SELECT p.id, p.host_id, p.name, h.name AS host_name,
+                    h.landing_host, p.listen_port, p.publish_host, p.publish_port,
+                    p.protocol, p.transport, p.security, p.server_name,
+                    p.websocket_path, p.vless_encryption, p.reality_public_key,
+                    p.reality_short_id, p.reality_fingerprint, p.status
+             FROM proxy_nodes p
+             INNER JOIN nodes h ON h.id = p.host_id
+             WHERE p.status != 'deleted' AND h.management_status != 'deleted'
+             ORDER BY h.name ASC, p.name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn create_proxy_node(&self, node: &models::NewProxyNode) -> Result<(), StorageError> {
+        self.create_proxy_node_with_status(node, "active").await
+    }
+
+    pub async fn create_proxy_node_with_status(
+        &self,
+        node: &models::NewProxyNode,
+        status: &str,
+    ) -> Result<(), StorageError> {
+        validate_proxy_node(node)?;
+        if !matches!(status, "active" | "disabled") {
+            return Err(StorageError::Validation(
+                "invalid initial Xray node status".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let host_active = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM nodes WHERE id = ? AND management_status != 'deleted'
+             )",
+        )
+        .bind(&node.host_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if host_active != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::Validation(format!(
+                "unknown managed host: {}",
+                node.host_id
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO proxy_nodes
+                (id, host_id, name, protocol, transport, security, listen_port,
+                 publish_host, publish_port, server_name, websocket_path,
+                 vless_encryption, reality_public_key, reality_short_id,
+                 reality_fingerprint, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&node.id)
+        .bind(&node.host_id)
+        .bind(node.name.trim())
+        .bind(&node.protocol)
+        .bind(&node.transport)
+        .bind(&node.security)
+        .bind(node.listen_port)
+        .bind(&node.publish_host)
+        .bind(node.publish_port)
+        .bind(&node.server_name)
+        .bind(&node.websocket_path)
+        .bind(&node.vless_encryption)
+        .bind(&node.reality_public_key)
+        .bind(&node.reality_short_id)
+        .bind(&node.reality_fingerprint)
+        .bind(status)
+        .bind(node.created_at)
+        .bind(node.created_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE nodes SET desired_revision = desired_revision + 1, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(node.created_at)
+        .bind(&node.host_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_proxy_node(
+        &self,
+        proxy_node_id: &str,
+        node: &models::UpdateProxyNode,
+    ) -> Result<bool, StorageError> {
+        validate_proxy_node_fields(
+            proxy_node_id,
+            &node.host_id,
+            &node.name,
+            node.listen_port,
+            node.publish_host.as_deref(),
+            node.publish_port,
+            &node.protocol,
+            &node.transport,
+            &node.security,
+            node.server_name.as_deref(),
+            node.websocket_path.as_deref(),
+            node.reality_public_key.as_deref(),
+            node.reality_short_id.as_deref(),
+        )?;
+        let mut tx = self.pool.begin().await?;
+        let previous_host = sqlx::query_scalar::<_, String>(
+            "SELECT host_id FROM proxy_nodes WHERE id = ? AND status != 'deleted'",
+        )
+        .bind(proxy_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(previous_host) = previous_host else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let host_active = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM nodes WHERE id = ? AND management_status != 'deleted'
+             )",
+        )
+        .bind(&node.host_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if host_active != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::Validation(format!(
+                "unknown managed host: {}",
+                node.host_id
+            )));
+        }
+        sqlx::query(
+            "UPDATE proxy_nodes
+             SET host_id = ?, name = ?, protocol = ?, transport = ?, security = ?,
+                 listen_port = ?, publish_host = ?, publish_port = ?, server_name = ?,
+                 websocket_path = ?, vless_encryption = ?, reality_public_key = ?,
+                 reality_short_id = ?, reality_fingerprint = ?, updated_at = ?
+             WHERE id = ? AND status != 'deleted'",
+        )
+        .bind(&node.host_id)
+        .bind(node.name.trim())
+        .bind(&node.protocol)
+        .bind(&node.transport)
+        .bind(&node.security)
+        .bind(node.listen_port)
+        .bind(&node.publish_host)
+        .bind(node.publish_port)
+        .bind(&node.server_name)
+        .bind(&node.websocket_path)
+        .bind(&node.vless_encryption)
+        .bind(&node.reality_public_key)
+        .bind(&node.reality_short_id)
+        .bind(&node.reality_fingerprint)
+        .bind(node.updated_at)
+        .bind(proxy_node_id)
+        .execute(&mut *tx)
+        .await?;
+        let affected_hosts = if previous_host == node.host_id {
+            vec![previous_host.as_str()]
+        } else {
+            vec![previous_host.as_str(), node.host_id.as_str()]
+        };
+        for host_id in affected_hosts {
+            sqlx::query(
+                "UPDATE nodes SET desired_revision = desired_revision + 1, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(node.updated_at)
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn set_proxy_node_status(
+        &self,
+        proxy_node_id: &str,
+        status: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if !matches!(status, "active" | "disabled") {
+            return Err(StorageError::Validation("invalid Xray node status".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+        let host_id = sqlx::query_scalar::<_, String>(
+            "SELECT host_id FROM proxy_nodes WHERE id = ? AND status != 'deleted'",
+        )
+        .bind(proxy_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(host_id) = host_id else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query("UPDATE proxy_nodes SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(now)
+            .bind(proxy_node_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE nodes SET desired_revision = desired_revision + 1, updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(host_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn delete_proxy_node(
+        &self,
+        proxy_node_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let host_id = sqlx::query_scalar::<_, String>(
+            "SELECT host_id FROM proxy_nodes WHERE id = ? AND status != 'deleted'",
+        )
+        .bind(proxy_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(host_id) = host_id else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let references = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM subscription_proxy_nodes
+             WHERE proxy_node_id = ? AND enabled = 1",
+        )
+        .bind(proxy_node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if references > 0 {
+            tx.rollback().await?;
+            return Err(StorageError::Validation(
+                "remove subscription assignments before deleting Xray node".into(),
+            ));
+        }
+        sqlx::query("UPDATE proxy_nodes SET status = 'deleted', updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(proxy_node_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE nodes SET desired_revision = desired_revision + 1, updated_at = ? WHERE id = ?",
+        )
+        .bind(now)
+        .bind(host_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn update_node(
@@ -1136,10 +1530,11 @@ impl Database {
             return Ok((revision.max(0) as u64, Vec::new()));
         }
         let users = sqlx::query_as::<_, models::DesiredXrayUser>(
-            "SELECT s.id AS subscription_id, s.xray_email, s.xray_uuid
-             FROM subscriptions s
-             INNER JOIN subscription_nodes sn ON sn.subscription_id = s.id
-             WHERE sn.node_id = ? AND sn.enabled = 1
+            "SELECT DISTINCT s.id AS subscription_id, s.xray_email, s.xray_uuid
+              FROM subscriptions s
+              INNER JOIN subscription_proxy_nodes spn ON spn.subscription_id = s.id
+              INNER JOIN proxy_nodes p ON p.id = spn.proxy_node_id
+              WHERE p.host_id = ? AND spn.enabled = 1 AND p.status = 'active'
                AND s.status = 'active'
                AND s.starts_at <= ?
                AND (s.expires_at IS NULL OR s.expires_at > ?)
@@ -1327,6 +1722,16 @@ impl Database {
             return Ok(None);
         };
         let subscriptions = self.list_user_subscriptions(user_id).await?;
+        let proxy_nodes = sqlx::query_as::<_, models::SubscriptionProxyNode>(
+            "SELECT spn.subscription_id, spn.proxy_node_id
+             FROM subscription_proxy_nodes spn
+             INNER JOIN subscriptions s ON s.id = spn.subscription_id
+             WHERE s.user_id = ? AND spn.enabled = 1
+             ORDER BY spn.subscription_id, spn.sort_order",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         let mut node_usage = Vec::new();
         let mut nic_usage = Vec::new();
         let mut nic_bindings = Vec::new();
@@ -1386,6 +1791,7 @@ impl Database {
         Ok(Some(models::UserDetail {
             user,
             subscriptions,
+            proxy_nodes,
             node_usage,
             nic_usage,
             nic_bindings,
@@ -1424,6 +1830,29 @@ impl Database {
              WHERE sn.subscription_id = ? AND sn.enabled = 1
                AND n.management_status = 'active'
              ORDER BY sn.sort_order ASC, n.name ASC",
+        )
+        .bind(subscription_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn subscription_proxy_nodes(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Vec<models::ProxyNodeRecord>, StorageError> {
+        let rows = sqlx::query_as::<_, models::ProxyNodeRecord>(
+            "SELECT p.id, p.host_id, p.name, h.name AS host_name,
+                    h.landing_host, p.listen_port, p.publish_host, p.publish_port,
+                    p.protocol, p.transport, p.security, p.server_name,
+                    p.websocket_path, p.vless_encryption, p.reality_public_key,
+                    p.reality_short_id, p.reality_fingerprint, p.status
+             FROM proxy_nodes p
+             INNER JOIN nodes h ON h.id = p.host_id
+             INNER JOIN subscription_proxy_nodes spn ON spn.proxy_node_id = p.id
+             WHERE spn.subscription_id = ? AND spn.enabled = 1
+               AND p.status = 'active' AND h.management_status = 'active'
+             ORDER BY spn.sort_order ASC, p.name ASC",
         )
         .bind(subscription_id)
         .fetch_all(&self.pool)
@@ -2297,6 +2726,7 @@ impl Database {
         node_id: &str,
         now: i64,
     ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT OR IGNORE INTO nodes
                 (id, name, landing_host, xray_listen_port, status, created_at, updated_at)
@@ -2306,8 +2736,22 @@ impl Database {
         .bind(format!("dev-{node_id}"))
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO proxy_nodes
+                (id, host_id, name, protocol, transport, security, listen_port,
+                 status, created_at, updated_at)
+             VALUES (?, ?, ?, 'vless', 'tcp', 'none', 443, 'active', ?, ?)",
+        )
+        .bind(node_id)
+        .bind(node_id)
+        .bind(format!("dev-{node_id}"))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2466,6 +2910,121 @@ fn missing_text(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
+fn validate_managed_host(id: &str, name: &str, landing_host: &str) -> Result<(), StorageError> {
+    if id.trim().is_empty() || name.trim().is_empty() || landing_host.trim().is_empty() {
+        return Err(StorageError::Validation(
+            "host ID, name, and address are required".into(),
+        ));
+    }
+    if landing_host.contains("://") || landing_host.contains('/') {
+        return Err(StorageError::Validation(
+            "host address must be a host or IP, not a URL".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proxy_node(node: &models::NewProxyNode) -> Result<(), StorageError> {
+    validate_proxy_node_fields(
+        &node.id,
+        &node.host_id,
+        &node.name,
+        node.listen_port,
+        node.publish_host.as_deref(),
+        node.publish_port,
+        &node.protocol,
+        &node.transport,
+        &node.security,
+        node.server_name.as_deref(),
+        node.websocket_path.as_deref(),
+        node.reality_public_key.as_deref(),
+        node.reality_short_id.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_proxy_node_fields(
+    id: &str,
+    host_id: &str,
+    name: &str,
+    listen_port: i64,
+    publish_host: Option<&str>,
+    publish_port: Option<i64>,
+    protocol: &str,
+    transport: &str,
+    security: &str,
+    server_name: Option<&str>,
+    websocket_path: Option<&str>,
+    reality_public_key: Option<&str>,
+    reality_short_id: Option<&str>,
+) -> Result<(), StorageError> {
+    if id.trim().is_empty()
+        || host_id.trim().is_empty()
+        || name.trim().is_empty()
+        || !(1..=65_535).contains(&listen_port)
+    {
+        return Err(StorageError::Validation(
+            "invalid Xray node identity or listen port".into(),
+        ));
+    }
+    if publish_host.is_some() != publish_port.is_some()
+        || publish_port.is_some_and(|port| !(1..=65_535).contains(&port))
+    {
+        return Err(StorageError::Validation(
+            "publish host and port must be provided together".into(),
+        ));
+    }
+    if publish_host
+        .is_some_and(|host| host.trim().is_empty() || host.contains("//") || host.contains('/'))
+    {
+        return Err(StorageError::Validation(
+            "publish host must be a host or IP, not a URL".into(),
+        ));
+    }
+    match protocol {
+        "vless" => {
+            if !matches!(transport, "tcp" | "ws")
+                || !matches!(security, "none" | "tls" | "reality")
+                || (transport == "ws" && security == "reality")
+            {
+                return Err(StorageError::Validation(
+                    "unsupported VLESS transport and security combination".into(),
+                ));
+            }
+            if transport == "ws" && missing_text(websocket_path) {
+                return Err(StorageError::Validation(
+                    "VLESS WebSocket nodes require a path".into(),
+                ));
+            }
+            if matches!(security, "tls" | "reality") && missing_text(server_name) {
+                return Err(StorageError::Validation(
+                    "TLS and Reality nodes require server_name".into(),
+                ));
+            }
+            if security == "reality"
+                && (missing_text(reality_public_key) || missing_text(reality_short_id))
+            {
+                return Err(StorageError::Validation(
+                    "Reality nodes require public key and short ID".into(),
+                ));
+            }
+        }
+        "shadowsocks" => {
+            if transport != "tcp" || security != "none" {
+                return Err(StorageError::Validation(
+                    "Shadowsocks nodes use the native TCP transport without TLS".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(StorageError::Validation(
+                "unsupported Xray inbound protocol".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{models, Database};
@@ -2556,6 +3115,113 @@ mod tests {
             .await
             .expect("quota-filtered users");
         assert!(desired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stores_multiple_proxy_nodes_on_one_managed_host() {
+        let (_temp, database) = test_database().await;
+        database
+            .ensure_development_node("host-a", 10)
+            .await
+            .expect("managed host");
+        database
+            .create_proxy_node(&models::NewProxyNode {
+                id: "proxy-reality".into(),
+                host_id: "host-a".into(),
+                name: "US Reality".into(),
+                listen_port: 4443,
+                publish_host: None,
+                publish_port: None,
+                protocol: "vless".into(),
+                transport: "tcp".into(),
+                security: "reality".into(),
+                server_name: Some("www.example.com".into()),
+                websocket_path: None,
+                vless_encryption: None,
+                reality_public_key: Some("public-key".into()),
+                reality_short_id: Some("0123456789abcdef".into()),
+                reality_fingerprint: Some("chrome".into()),
+                created_at: 11,
+            })
+            .await
+            .expect("Reality node");
+        database
+            .create_proxy_node(&models::NewProxyNode {
+                id: "proxy-ws".into(),
+                host_id: "host-a".into(),
+                name: "US WebSocket".into(),
+                listen_port: 8443,
+                publish_host: Some("edge.example.com".into()),
+                publish_port: Some(443),
+                protocol: "vless".into(),
+                transport: "ws".into(),
+                security: "tls".into(),
+                server_name: Some("edge.example.com".into()),
+                websocket_path: Some("/xenon".into()),
+                vless_encryption: None,
+                reality_public_key: None,
+                reality_short_id: None,
+                reality_fingerprint: None,
+                created_at: 12,
+            })
+            .await
+            .expect("WebSocket node");
+
+        let nodes = database.list_proxy_nodes().await.expect("proxy nodes");
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes.iter().all(|node| node.host_id == "host-a"));
+        assert_eq!(nodes[0].host_name, "dev-host-a");
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.id == "proxy-ws")
+                .and_then(|node| node.websocket_path.as_deref()),
+            Some("/xenon")
+        );
+
+        assert!(database
+            .update_proxy_node(
+                "proxy-ws",
+                &models::UpdateProxyNode {
+                    host_id: "host-a".into(),
+                    name: "US WebSocket Updated".into(),
+                    listen_port: 9443,
+                    publish_host: Some("edge.example.com".into()),
+                    publish_port: Some(443),
+                    protocol: "vless".into(),
+                    transport: "ws".into(),
+                    security: "tls".into(),
+                    server_name: Some("edge.example.com".into()),
+                    websocket_path: Some("/updated".into()),
+                    vless_encryption: None,
+                    reality_public_key: None,
+                    reality_short_id: None,
+                    reality_fingerprint: None,
+                    updated_at: 13,
+                },
+            )
+            .await
+            .expect("update WebSocket node"));
+        assert!(database
+            .set_proxy_node_status("proxy-ws", "disabled", 14)
+            .await
+            .expect("disable WebSocket node"));
+        assert!(database
+            .delete_proxy_node("proxy-reality", 15)
+            .await
+            .expect("delete Reality node"));
+        let nodes = database
+            .list_proxy_nodes()
+            .await
+            .expect("updated proxy nodes");
+        assert_eq!(nodes.len(), 2);
+        let ws = nodes
+            .iter()
+            .find(|node| node.id == "proxy-ws")
+            .expect("updated WebSocket node");
+        assert_eq!(ws.name, "US WebSocket Updated");
+        assert_eq!(ws.listen_port, 9443);
+        assert_eq!(ws.status, "disabled");
     }
 
     #[tokio::test]
@@ -3144,6 +3810,16 @@ mod tests {
             .insert_interface_snapshots("node-nic", "boot-nic", 1, 10, &[("eth0".into(), 100, 200)])
             .await
             .expect("interface");
+        let host_totals = database
+            .latest_nic_totals_by_node()
+            .await
+            .expect("host NIC totals");
+        assert_eq!(host_totals.len(), 1);
+        assert_eq!(host_totals[0].node_id, "node-nic");
+        assert_eq!(
+            (host_totals[0].rx_bytes, host_totals[0].tx_bytes),
+            (100, 200)
+        );
         database
             .create_user_subscription(&input)
             .await

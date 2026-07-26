@@ -284,7 +284,7 @@ impl AgentControl for AgentService {
         {
             let mut state = state.write().await;
             state.connected_agents = state.connected_agents.saturating_add(1);
-            state.last_agent_event = Some(describe_registration(&register));
+            state.record_agent_event(describe_registration(&register));
         }
         tokio::spawn(async move {
             while let Some(result) = inbound.next().await {
@@ -440,7 +440,7 @@ impl AgentControl for AgentService {
                         }
                         let event = describe_message(&message);
                         let mut state = state.write().await;
-                        state.last_agent_event = Some(event);
+                        state.record_agent_event(event);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "agent stream read failed");
