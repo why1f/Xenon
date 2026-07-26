@@ -166,6 +166,31 @@ curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-pa
 
 需要放行端口：`50051`（gRPC mTLS）、`50052`（Enrollment）、`18181`（订阅 HTTP）以及各节点的 Xray 端口。
 
+### 一键卸载
+
+主控（加 `--purge` 连配置、证书和数据库一起删除）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-panel.sh | sudo bash -s -- --uninstall --purge
+```
+
+被控 Agent：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-agent.sh | sudo bash -s -- --uninstall
+```
+
+### 从测试环境切换到正式版
+
+不能直接在测试机上跑正式安装命令：测试配置（回环、明文 Token）会被保留而不是覆盖，正式安装器检测到它会拒绝继续。正确顺序是先卸载再安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-panel.sh | sudo bash -s -- --uninstall --purge
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-panel.sh | sudo bash
+```
+
+卸载时会自动识别并移除本机的回环测试 Agent；`--purge` 会删除测试数据库，正式环境从全新状态开始。
+
 ### 单机一键测试安装
 
 公开仓库可在 x86_64 或 ARM64、使用 systemd 的 Linux 测试机上匿名下载并安装：

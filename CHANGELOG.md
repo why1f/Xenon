@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0-alpha.7 - 2026-07-26
+
+### Added
+
+- `scripts/install-panel.sh`: production Panel one-line install that downloads the latest release, generates a self-signed server CA/certificate and Agent client CA, writes an mTLS + Enrollment configuration, and starts the systemd service; `--uninstall`/`--purge` remove the Panel (and a detected loopback test Agent) again.
+- Releases ship raw per-architecture `xenon-agent` binaries with SHA-256 digests.
+- The TUI-generated Agent install command resolves `{arch}` on the target machine, pins per-architecture digests, and embeds the Panel CA via `--ca-b64`, so one command enrolls any x86_64/aarch64 VPS.
+- `xenon-tui` wrapper: stops the headless service, opens the TUI, and restarts the service on exit.
+
+### Changed
+
+- TUI now has 仪表盘/用户/节点 tabs: users get a dedicated page with the summary strip and full ranking; the dashboard keeps a Top-5 view.
+- All create/edit/confirm flows render as centered modal dialogs over their parent page with Chinese labels and unified key hints.
+- Panel startup clears stale `online` agent/node presence left behind by an unclean shutdown.
+- The test bootstrap defaults to the latest release instead of a pinned tag.
+
 ## 0.1.0-alpha.6 - 2026-07-26
 
 ### Added

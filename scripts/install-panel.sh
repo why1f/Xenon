@@ -8,12 +8,52 @@ fail() {
   exit 1
 }
 
+UNINSTALL=0
+PURGE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --uninstall) UNINSTALL=1; shift ;;
+    --purge) UNINSTALL=1; PURGE=1; shift ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 [ "$(uname -s)" = "Linux" ] || fail "Linux is required"
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  systemctl disable --now xenon.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xenon.service /usr/local/bin/xenon /usr/local/bin/xenon-tui
+  # A loopback test install also runs a local Agent pointed at this Panel;
+  # remove it too so a later production install starts clean.
+  if grep -qs 'panel_endpoint = "http://127.0.0.1:50051"' /var/lib/xenon/agent/agent.toml 2>/dev/null || \
+     grep -qs 'panel_endpoint = "https://127.0.0.1:50051"' /var/lib/xenon/agent/agent.toml 2>/dev/null; then
+    printf 'Removing local loopback test Agent as well.\n'
+    systemctl disable --now xenon-agent.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/xenon-agent.service /usr/local/bin/xenon-agent
+    rm -rf /var/lib/xenon/agent
+  fi
+  systemctl daemon-reload
+  if [ "$PURGE" -eq 1 ]; then
+    rm -rf /etc/xenon /var/lib/xenon
+    printf 'Xenon Panel uninstalled; configuration, certificates, and data removed.\n'
+  else
+    printf 'Xenon Panel uninstalled; /etc/xenon and /var/lib/xenon were kept.\n'
+    printf 'Remove them too with: --purge\n'
+  fi
+  exit 0
+fi
+
 for command_name in curl sha256sum tar openssl; do
   command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
+
+if [ -f /etc/xenon/xenon.toml ] && \
+  grep -q 'allow_insecure_dev_token = true' /etc/xenon/xenon.toml; then
+  fail "found a loopback test configuration at /etc/xenon/xenon.toml; \
+uninstall the test environment first: re-run this script with --uninstall --purge"
+fi
 
 case "$(uname -m)" in
   x86_64 | amd64) architecture="x86_64" ;;
