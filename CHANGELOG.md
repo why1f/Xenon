@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-alpha.13 - 2026-07-26
+
+### Fixed
+
+- Give the runtime Enrollment CA private key to the `xenon` service account with mode `0600`, satisfying both service access and Panel permission validation on new and existing installations.
+- Remove a non-portable escaped quote from the legacy subscription migration's awk regular expression.
+- Always stop the systemd Panel before entering the TUI, including while it is activating or restarting, and require a stable service state before the installer reports success.
+
 ## 0.1.0-alpha.12 - 2026-07-26
 
 ### Fixed

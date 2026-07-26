@@ -156,8 +156,16 @@ if [ ! -f "$tls_dir/server-ca.crt" ]; then
     -subj "/CN=Xenon Agents CA" -days 3650 2>/dev/null
   chown root:xenon "$tls_dir"/*
   chmod 0644 "$tls_dir"/*.crt
-  chmod 0640 "$tls_dir/server.key" "$tls_dir/clients-ca.key"
+  chmod 0640 "$tls_dir/server.key"
+  chown root:root "$tls_dir/server-ca.key"
   chmod 0600 "$tls_dir/server-ca.key"
+fi
+
+# Enrollment signs Agent certificates at runtime. Its CA key must be readable by
+# the xenon service account while remaining inaccessible to group/other users.
+if [ -f "$tls_dir/clients-ca.key" ]; then
+  chown xenon:xenon "$tls_dir/clients-ca.key"
+  chmod 0600 "$tls_dir/clients-ca.key"
 fi
 
 if [ ! -f /etc/xenon/xenon.toml ]; then
@@ -222,7 +230,7 @@ else
     awk '
       /^\[/ { in_subscription = ($0 == "[subscription_http]") }
       in_subscription && $0 == "tls_enabled = false" { plaintext = 1 }
-      in_subscription && $0 ~ /^public_base_url = "http:\/\/[^\"]+:18181"$/ { public_url = 1 }
+      in_subscription && $0 ~ /^public_base_url = "http:\/\/[^"]+:18181"$/ { public_url = 1 }
       END { exit !(plaintext && public_url) }
     ' /etc/xenon/xenon.toml && \
     ! awk '
@@ -253,11 +261,17 @@ install -o root -g root -m 0644 \
   "$bundle_dir/systemd/xenon.service" /etc/systemd/system/xenon.service
 systemctl daemon-reload
 systemctl enable --now xenon.service
-for _ in $(seq 1 25); do
-  systemctl is-active --quiet xenon.service && break
+stable=0
+for _ in $(seq 1 30); do
+  if systemctl is-active --quiet xenon.service; then
+    stable=$((stable + 1))
+    [ "$stable" -ge 5 ] && break
+  else
+    stable=0
+  fi
   sleep 0.2
 done
-systemctl is-active --quiet xenon.service || \
+[ "$stable" -ge 5 ] || \
   fail "xenon.service did not start; inspect journalctl -u xenon"
 
 printf '\nXenon Panel %s installed for host %s.\n' "$version" "$host"

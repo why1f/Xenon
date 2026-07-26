@@ -14,13 +14,16 @@ command -v systemctl >/dev/null 2>&1 || fail "systemd is required"
 
 # The TUI runs in the same process as the Panel services, so the headless
 # service must yield its ports first and take over again when the TUI exits.
-was_active=0
-if systemctl is-active --quiet xenon.service; then
-  was_active=1
-  systemctl stop xenon.service
+restart_after=0
+if systemctl is-active --quiet xenon.service || \
+  systemctl is-enabled --quiet xenon.service; then
+  restart_after=1
 fi
+# Stop unconditionally so an activating/restarting service cannot race the TUI
+# for the database lock or listening ports.
+systemctl stop xenon.service
 restore() {
-  if [ "$was_active" -eq 1 ]; then
+  if [ "$restart_after" -eq 1 ]; then
     systemctl start xenon.service || \
       printf 'xenon-tui: failed to restart xenon.service; run: systemctl start xenon\n' >&2
   fi
