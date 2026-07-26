@@ -250,6 +250,7 @@ pub async fn run(
     let mut tui_task = tokio::task::spawn_blocking(move || run_blocking(snapshot_rx, command_tx));
     let mut refresh = tokio::time::interval(Duration::from_secs(2));
     let mut user_detail = None;
+    let mut notice = String::new();
     let mut rate_tracker = NicRateTracker::default();
     let mut host_rate_trackers = HashMap::<String, NicRateTracker>::new();
 
@@ -272,7 +273,7 @@ pub async fn run(
                         }));
                     }
                 }
-                let mut snapshot = load_snapshot(&state, &database, String::new(), user_detail.clone()).await?;
+                let mut snapshot = load_snapshot(&state, &database, notice.clone(), user_detail.clone()).await?;
                 rate_tracker.apply(&mut snapshot);
                 apply_host_nic_rates(&mut snapshot, &host_rate_trackers);
                 if snapshot_tx.send(snapshot).is_err() {
@@ -403,12 +404,12 @@ pub async fn run(
                     }
                     TuiCommand::DeleteHost(node_id) => delete_host(&database, &node_id).await,
                 };
-                let notice = match result {
+                notice = match result {
                     Ok(message) => message,
                     Err(error) => format!("operation failed: {error}"),
                 };
                 let snapshot = {
-                    let mut snapshot = load_snapshot(&state, &database, notice, user_detail.clone()).await?;
+                    let mut snapshot = load_snapshot(&state, &database, notice.clone(), user_detail.clone()).await?;
                     rate_tracker.apply(&mut snapshot);
                     apply_host_nic_rates(&mut snapshot, &host_rate_trackers);
                     snapshot
@@ -1082,6 +1083,7 @@ enum Page {
     Logs,
     Create,
     HostCreate,
+    HostCreateResult,
     ProxyNodeCreate,
     Revoke,
     UserDetail,
@@ -1403,8 +1405,25 @@ fn run_blocking(
     let mut edit_proxy_node_id = String::new();
     let mut delete_proxy_node_id = String::new();
     let mut unbind_binding_id = String::new();
+    let mut pending_host_notice = None::<String>;
+    let mut host_create_result = String::new();
+    let mut dismissed_notice = None::<String>;
+    let mut last_seen_notice = String::new();
     let result = loop {
-        let snapshot = snapshot_rx.borrow().clone();
+        let mut snapshot = snapshot_rx.borrow().clone();
+        let raw_notice = snapshot.notice.clone();
+        last_seen_notice.clone_from(&raw_notice);
+        if pending_host_notice
+            .as_deref()
+            .is_some_and(|previous| !raw_notice.is_empty() && raw_notice != previous)
+        {
+            host_create_result.clone_from(&raw_notice);
+            pending_host_notice = None;
+            page = Page::HostCreateResult;
+        }
+        if dismissed_notice.as_deref() == Some(raw_notice.as_str()) {
+            snapshot.notice.clear();
+        }
         selected_user = selected_user.min(snapshot.users.len().saturating_sub(1));
         if let Some(detail) = snapshot.user_detail.as_ref() {
             selected_subscription =
@@ -1430,6 +1449,11 @@ fn run_blocking(
                 let area = draw_primary_shell(frame, &snapshot, 3);
                 draw_nodes(frame, area, &snapshot, selected_node);
                 draw_host_create(frame, &host_form);
+            }
+            Page::HostCreateResult => {
+                let area = draw_primary_shell(frame, &snapshot, 3);
+                draw_nodes(frame, area, &snapshot, selected_node);
+                draw_host_create_result(frame, &host_create_result);
             }
             Page::ProxyNodeCreate => {
                 let area = draw_primary_shell(frame, &snapshot, 2);
@@ -1613,6 +1637,7 @@ fn run_blocking(
                             host_form.active = (host_form.active + 1) % 2
                         }
                         KeyCode::Enter => {
+                            pending_host_notice = Some(last_seen_notice.clone());
                             if command_tx
                                 .blocking_send(TuiCommand::CreateHost(host_form.input()))
                                 .is_err()
@@ -1625,6 +1650,14 @@ fn run_blocking(
                             host_form.fields[host_form.active].pop();
                         }
                         KeyCode::Char(value) => host_form.fields[host_form.active].push(value),
+                        _ => {}
+                    },
+                    Page::HostCreateResult => match key.code {
+                        KeyCode::Enter | KeyCode::Esc => {
+                            dismissed_notice = Some(host_create_result.clone());
+                            page = Page::Hosts;
+                        }
+                        KeyCode::Char('q') => break Ok(()),
                         _ => {}
                     },
                     Page::ProxyNodeCreate => match key.code {
@@ -3308,6 +3341,47 @@ fn draw_host_create(frame: &mut ratatui::Frame<'_>, form: &HostFormState) {
     draw_host_form(frame, form, "添加主机", "创建并生成 Agent 安装命令");
 }
 
+fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str) {
+    let (summary, command) = if let Some((summary, command)) = result.split_once("; install: ") {
+        (summary, Some(command))
+    } else {
+        (result, None)
+    };
+    let mut body = vec![
+        Line::from(Span::styled(
+            summary.to_string(),
+            Style::default().fg(if result.starts_with("operation failed:") {
+                Color::Red
+            } else {
+                Color::Green
+            }),
+        )),
+        Line::default(),
+    ];
+    if let Some(command) = command {
+        body.push(Line::from(Span::styled(
+            "Agent 一键安装命令（包含一次性注册 Token）：",
+            Style::default().fg(Color::Yellow),
+        )));
+        body.push(Line::default());
+        body.push(Line::from(command.to_string()));
+    } else if result.contains("installer is not configured") {
+        body.push(Line::from(
+            "未配置 [agent_install]，当前只能显示注册 Token 和 Panel 地址。",
+        ));
+        body.push(Line::default());
+        body.push(Line::from(result.to_string()));
+    }
+    let inner = modal_area(
+        frame,
+        100,
+        20,
+        "主机创建结果",
+        result.starts_with("operation failed:"),
+    );
+    modal_body_and_hint(frame, inner, body, "[Enter/Esc] 关闭  [q] 退出");
+}
+
 fn draw_host_form(frame: &mut ratatui::Frame<'_>, form: &HostFormState, title: &str, action: &str) {
     let labels = ["主机名称 *必填", "主机地址/IP *必填"];
     let body = form_lines(&labels, &form.fields, form.active);
@@ -3619,6 +3693,10 @@ mod tests {
                 );
                 super::draw_create(frame, &snapshot, &form);
                 super::draw_host_create(frame, &host_form);
+                super::draw_host_create_result(
+                    frame,
+                    "created host host-a; install: curl -fsSL https://example.test | sudo bash",
+                );
                 super::draw_proxy_node_create(frame, &snapshot, &proxy_node_form);
             })
             .expect("small terminal render");
@@ -3759,6 +3837,21 @@ mod tests {
         assert!(compact_hosts.contains("网卡实时"), "{hosts}");
         assert!(compact_hosts.contains("↓2.0KiB/s↑1.0KiB/s"), "{hosts}");
         assert!(compact_hosts.contains("↓8.0MiB↑2.0MiB"), "{hosts}");
+    }
+
+    #[test]
+    fn host_creation_result_shows_the_full_agent_install_command() {
+        let result = "created host host-a; install: curl -fsSL --proto '=https' \
+                      https://downloads.example/install-agent.sh | sudo bash -s -- \
+                      --panel 'https://panel.example:50051' --node 'host-a' --token 'secret'";
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| super::draw_host_create_result(frame, result))
+            .expect("result render");
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("created host host-a"), "{rendered}");
+        assert!(rendered.contains("install-agent.sh"), "{rendered}");
+        assert!(rendered.contains("--token 'secret'"), "{rendered}");
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {

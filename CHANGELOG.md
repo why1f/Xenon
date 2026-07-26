@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.9 - 2026-07-26
+
+### Fixed
+
+- Show the complete one-time Agent installation command in a persistent, wrapping TUI dialog after creating a managed host instead of briefly clipping it in the one-line footer.
+- Preserve one-time operation results across periodic TUI refreshes until the operator dismisses them.
+
 ## 0.1.0-alpha.8 - 2026-07-26
 
 ### Added

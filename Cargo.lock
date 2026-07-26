@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "xenon"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3254,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "xenon-agent"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "anyhow",
  "libc",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "xenon-domain"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "chrono",
  "serde",
@@ -3290,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "xenon-protocol"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "xenon-storage"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "chrono",
  "sqlx",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "xray-core-protocol"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "xray-embedded-runner"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "anyhow",
  "libc",
