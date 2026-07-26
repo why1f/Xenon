@@ -59,6 +59,10 @@ fi
 
 install -o root -g root -m 0755 "$panel_binary" /usr/local/bin/xenon
 install -o root -g root -m 0755 "$agent_binary" /usr/local/bin/xenon-agent
+if [ -f "$bundle_dir/scripts/xenon-tui.sh" ]; then
+  install -o root -g root -m 0755 "$bundle_dir/scripts/xenon-tui.sh" \
+    /usr/local/bin/xenon-tui
+fi
 install -d -o root -g xenon -m 0750 /etc/xenon
 install -d -o xenon -g xenon -m 0750 /var/lib/xenon/panel
 install -d -o xenon-agent -g xenon-agent -m 0700 /var/lib/xenon/agent
@@ -167,5 +171,4 @@ port_in_use 10085 || \
 printf 'Xenon local test installation completed.\n'
 printf 'Health: http://127.0.0.1:18181/healthz\n'
 printf 'Logs: journalctl -u xenon -u xenon-agent -f\n'
-printf 'TUI: systemctl stop xenon && sudo -u xenon XENON_CONFIG=/etc/xenon/xenon.toml /usr/local/bin/xenon\n'
-printf 'Restart headless mode after leaving TUI: systemctl start xenon\n'
+printf 'TUI: sudo xenon-tui  (stops the headless service, opens the TUI, restarts it on exit)\n'

@@ -125,6 +125,10 @@ async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
         .ensure_default_admin(Utc::now().timestamp())
         .await
         .context("create default admin")?;
+    database
+        .reset_stale_presence(Utc::now().timestamp())
+        .await
+        .context("reset stale agent presence")?;
 
     let state = Arc::new(RwLock::new(RuntimeState::default()));
     let grpc_state = state.clone();

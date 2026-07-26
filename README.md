@@ -184,12 +184,10 @@ sudo systemctl status xenon xenon-agent
 sudo journalctl -u xenon -u xenon-agent -f
 ```
 
-进入 TUI 前需停止 headless 主控，退出 TUI 后再恢复服务：
+进入 TUI 用一条命令即可；它会临时停止 headless 主控、打开 TUI，退出时自动恢复服务：
 
 ```bash
-sudo systemctl stop xenon
-sudo -u xenon XENON_CONFIG=/etc/xenon/xenon.toml /usr/local/bin/xenon
-sudo systemctl start xenon
+sudo xenon-tui
 ```
 
 正式多服务器部署不要使用 `install-test.sh`。应在启用 mTLS/Enrollment 的 Xenon 中创建节点，再执行 TUI 生成的 `scripts/install-agent.sh` 命令；生产安装器不会接受明文下载地址。

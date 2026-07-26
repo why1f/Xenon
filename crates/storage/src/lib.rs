@@ -2438,6 +2438,28 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    /// Presence flags in the database only stay accurate while the Panel that
+    /// wrote them is alive. After a Panel restart no gRPC stream exists yet,
+    /// so any lingering 'online' rows are stale and must be cleared; agents
+    /// flip back to 'online' as soon as they reconnect.
+    pub async fn reset_stale_presence(&self, now: i64) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE agents SET status = 'offline', updated_at = ?
+             WHERE status = 'online'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE nodes SET status = 'offline', updated_at = ?
+             WHERE status = 'online'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn missing_text(value: Option<&str>) -> bool {

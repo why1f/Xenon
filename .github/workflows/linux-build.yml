@@ -20,6 +20,7 @@ on:
       - "scripts/bootstrap-test.sh"
       - "scripts/install-agent.sh"
       - "scripts/install-test.sh"
+      - "scripts/xenon-tui.sh"
       - "xenon.toml.example"
 
 permissions:
@@ -137,6 +138,7 @@ jobs:
           install -m 0755 scripts/install-agent.sh "$root/scripts/install-agent.sh"
           install -m 0755 scripts/bootstrap-test.sh "$root/scripts/bootstrap-test.sh"
           install -m 0755 scripts/install-test.sh "$root/scripts/install-test.sh"
+          install -m 0755 scripts/xenon-tui.sh "$root/scripts/xenon-tui.sh"
           install -m 0644 xenon.toml.example "$root/examples/xenon.toml.example"
           install -m 0644 agent.toml.example "$root/examples/agent.toml.example"
           install -m 0644 CHANGELOG.md "$root/CHANGELOG.md"
