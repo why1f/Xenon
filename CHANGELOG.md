@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.6 - 2026-07-26
+
+### Added
+
+- Dashboard realtime downlink/uplink rate sparklines computed from the latest NIC absolute counters, with automatic rebaselining after an Agent counter reset.
+- Dashboard user summary strip with enabled, over-quota, and expired counts plus the cycle charged total.
+- User ranking quota column showing the aggregate traffic limit and usage percentage; users with any unlimited subscription show `∞`.
+
+### Tests
+
+- Cover NIC rate computation, unchanged-sample holds, and counter-reset rebaselining in a dedicated tracker test.
+
 ## 0.1.0-alpha.5 - 2026-07-26
 
 ### Changed
