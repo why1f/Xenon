@@ -176,7 +176,11 @@ pub struct AgentInstallConfig {
     #[serde(default)]
     pub ca_url: String,
     #[serde(default)]
+    pub ca_sha256: String,
+    #[serde(default)]
     pub ca_path: String,
+    #[serde(default)]
+    pub bootstrap_url: String,
     #[serde(default)]
     pub panel_endpoint: String,
     #[serde(default)]
@@ -189,6 +193,25 @@ pub struct AgentInstallConfig {
 pub struct RegistrationConfig {
     #[serde(default)]
     pub allow_insecure_dev_token: bool,
+}
+
+impl AgentInstallConfig {
+    pub fn bootstrap_manifest(&self) -> String {
+        format!(
+            "panel_endpoint={}\nenrollment_endpoint={}\nserver_name={}\n\
+             binary_url={}\nbinary_sha256_x86_64={}\nbinary_sha256_aarch64={}\n\
+             binary_version={}\nca_url={}\nca_sha256={}\n",
+            self.panel_endpoint,
+            self.enrollment_endpoint,
+            self.server_name,
+            self.binary_url,
+            self.binary_sha256_x86_64,
+            self.binary_sha256_aarch64,
+            self.binary_version,
+            self.ca_url,
+            self.ca_sha256,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -478,22 +501,66 @@ impl PanelConfig {
                     anyhow::bail!("agent_install {name} must be a safe HTTPS URL");
                 }
             }
-            if !self.agent_install.ca_url.is_empty()
-                && (!self.agent_install.ca_url.starts_with("https://")
-                    || self.agent_install.ca_url.contains(char::is_whitespace)
-                    || self.agent_install.ca_url.contains(['\"', '\'', '\\']))
-            {
-                anyhow::bail!("agent_install ca_url must be a safe HTTPS URL");
-            }
             if self.agent_install.ca_url.is_empty() && self.agent_install.ca_path.is_empty() {
                 anyhow::bail!("agent_install needs ca_url or ca_path");
             }
             let valid_hash = |value: &str| {
                 value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
             };
+            if !self.agent_install.ca_url.is_empty() {
+                let safe_ca_url = (self.agent_install.ca_url.starts_with("https://")
+                    || self.agent_install.ca_url.starts_with("http://"))
+                    && !self.agent_install.ca_url.contains(char::is_whitespace)
+                    && !self.agent_install.ca_url.contains(['\"', '\'', '\\']);
+                if !safe_ca_url {
+                    anyhow::bail!("agent_install ca_url must be a safe HTTP(S) URL");
+                }
+                if self.agent_install.ca_url.starts_with("http://")
+                    && !valid_hash(&self.agent_install.ca_sha256)
+                {
+                    anyhow::bail!("agent_install HTTP ca_url requires ca_sha256");
+                }
+                if !self.agent_install.ca_sha256.is_empty()
+                    && !valid_hash(&self.agent_install.ca_sha256)
+                {
+                    anyhow::bail!("agent_install ca_sha256 must be a SHA-256 digest");
+                }
+            }
+            if !self.agent_install.ca_path.is_empty()
+                && !Path::new(&self.agent_install.ca_path).is_file()
+            {
+                anyhow::bail!(
+                    "agent_install CA file does not exist: {}",
+                    self.agent_install.ca_path
+                );
+            }
+            if !(self.agent_install.bootstrap_url.is_empty()
+                || self.agent_install.bootstrap_url.starts_with("https://")
+                || self.agent_install.bootstrap_url.starts_with("http://"))
+            {
+                anyhow::bail!("agent_install bootstrap_url must use HTTP(S)");
+            }
+            if self
+                .agent_install
+                .bootstrap_url
+                .contains(char::is_whitespace)
+                || self
+                    .agent_install
+                    .bootstrap_url
+                    .contains(['\"', '\'', '\\'])
+            {
+                anyhow::bail!("agent_install bootstrap_url is unsafe");
+            }
             let generic_hash = valid_hash(&self.agent_install.binary_sha256);
             let architecture_hashes = valid_hash(&self.agent_install.binary_sha256_x86_64)
                 && valid_hash(&self.agent_install.binary_sha256_aarch64);
+            if !self.agent_install.bootstrap_url.is_empty()
+                && (self.agent_install.ca_url.is_empty() || !architecture_hashes)
+            {
+                anyhow::bail!(
+                    "agent_install bootstrap requires ca_url and both architecture-specific SHA-256 values"
+                );
+            }
             if !generic_hash && !architecture_hashes {
                 anyhow::bail!(
                     "agent_install needs binary_sha256 or both architecture-specific SHA-256 values"
@@ -584,7 +651,8 @@ mod tests {
                 binary_sha256_x86_64: "a".repeat(64),
                 binary_sha256_aarch64: "b".repeat(64),
                 binary_version: "0.1.0-alpha.10".into(),
-                ca_path: "/etc/xenon/tls/server-ca.crt".into(),
+                ca_url: "http://panel.example.com:18181/agent-ca.crt".into(),
+                ca_sha256: "c".repeat(64),
                 panel_endpoint: "https://panel.example.com:50051".into(),
                 enrollment_endpoint: "https://panel.example.com:50052".into(),
                 server_name: "panel.example.com".into(),
@@ -593,5 +661,8 @@ mod tests {
             ..PanelConfig::default()
         };
         config.validate().await.expect("agent install config");
+        let manifest = config.agent_install.bootstrap_manifest();
+        assert!(manifest.contains("\nbinary_url=https://"));
+        assert!(!manifest.contains("\n "));
     }
 }

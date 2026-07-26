@@ -135,6 +135,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
+    let agent_ca_pem = if config.agent_install.enabled && !config.agent_install.ca_path.is_empty() {
+        Some(
+            tokio::fs::read(&config.agent_install.ca_path)
+                .await
+                .context("read public Agent trust CA")?,
+        )
+    } else {
+        None
+    };
+    let agent_bootstrap = (config.agent_install.enabled
+        && !config.agent_install.bootstrap_url.is_empty())
+    .then(|| config.agent_install.bootstrap_manifest().into_bytes());
     let database = xenon_storage::Database::connect(&config.database_path)
         .await
         .context("connect panel database")?;
@@ -207,7 +219,15 @@ async fn run_panel(config: PanelConfig, headless: bool) -> anyhow::Result<()> {
     };
     let http_failure_tx = server_failure_tx.clone();
     let http_task = tokio::spawn(async move {
-        let result = http::serve(http_addr, subscription_http, http_state, http_database).await;
+        let result = http::serve(
+            http_addr,
+            subscription_http,
+            http_state,
+            http_database,
+            agent_ca_pem,
+            agent_bootstrap,
+        )
+        .await;
         let error = result
             .context("subscription HTTP server stopped")
             .err()

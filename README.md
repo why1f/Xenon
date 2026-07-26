@@ -163,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-pa
 
 安装器会下载最新 Release、生成自签服务端 CA/证书与 Agent 客户端 CA、写入启用 mTLS 和 Enrollment 的 `/etc/xenon/xenon.toml`，并以 systemd 服务启动主控。有域名时用 `sudo XENON_HOST=panel.example.com bash` 指定；否则自动使用公网 IPv4。
 
-装好后执行 `sudo xenon-tui` 进入 TUI，切换到“主机 [4]”并按 `a` 创建主机，把弹窗中的命令放到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA。关闭过弹窗时，在主机页选中该主机按 `i` 即可重新生成。Agent 注册上线后，再到“节点 [3]”为该主机配置协议节点。
+装好后执行 `sudo xenon-tui` 进入 TUI，切换到“主机 [4]”并按 `a` 创建主机，在结果弹窗按 `y` 复制短安装命令，再放到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装。命令通过 SHA-256 固定主控提供的公开 bootstrap 清单；清单包含架构自适应的 Agent 地址、双架构摘要和主控 CA 地址/摘要，但不包含一次性 Token。关闭过弹窗时，在主机页选中该主机按 `i` 即可重新生成。Agent 注册上线后，再到“节点 [3]”为该主机配置协议节点。
 
 需要放行端口：`50051`（gRPC mTLS）、`50052`（Enrollment）、`18181`（订阅 HTTP）以及各节点的 Xray 端口。
 

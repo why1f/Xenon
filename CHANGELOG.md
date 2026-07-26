@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0-alpha.14 - 2026-07-26
+
+### Added
+
+- Add SHA-256-pinned public Agent bootstrap and CA endpoints, reducing generated Agent install commands without weakening trust verification.
+- Add `y` clipboard copy support to the Agent install result dialog through the terminal OSC 52 protocol.
+
+### Fixed
+
+- Refresh installer-managed `[agent_install]` release metadata during Panel upgrades so commands no longer remain pinned to an old Agent release.
+
 ## 0.1.0-alpha.13 - 2026-07-26
 
 ### Fixed

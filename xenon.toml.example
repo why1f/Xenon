@@ -60,10 +60,12 @@ binary_url = "https://github.com/why1f/Xenon/releases/download/vX.Y.Z/xenon-agen
 binary_sha256_x86_64 = ""
 binary_sha256_aarch64 = ""
 binary_version = ""
-# Embed the CA that signed the Panel server certificate directly in the
-# generated install command (recommended), or serve it from an HTTPS URL.
+# A pinned HTTP CA URL keeps generated commands short without trusting HTTP.
 ca_path = "/etc/xenon/tls/server-ca.crt"
 ca_url = ""
+ca_sha256 = ""
+# A pinned public bootstrap manifest folds release metadata into the short command.
+bootstrap_url = ""
 panel_endpoint = "https://panel.example.com:50051"
 enrollment_endpoint = "https://panel.example.com:50052"
 server_name = "panel.example.com"

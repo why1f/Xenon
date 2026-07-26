@@ -14,7 +14,10 @@ BINARY_SHA256_X86_64=""
 BINARY_SHA256_AARCH64=""
 CA_URL=""
 CA_B64=""
+CA_SHA256=""
 AGENT_VERSION=""
+BOOTSTRAP_URL=""
+BOOTSTRAP_SHA256=""
 UNINSTALL=0
 UPGRADE=0
 ROLLBACK=0
@@ -37,7 +40,10 @@ while [ "$#" -gt 0 ]; do
     --binary-sha256-aarch64) BINARY_SHA256_AARCH64="${2:-}"; shift 2 ;;
     --ca-url) CA_URL="${2:-}"; shift 2 ;;
     --ca-b64) CA_B64="${2:-}"; shift 2 ;;
+    --ca-sha256) CA_SHA256="${2:-}"; shift 2 ;;
     --agent-version) AGENT_VERSION="${2:-}"; shift 2 ;;
+    --bootstrap-url) BOOTSTRAP_URL="${2:-}"; shift 2 ;;
+    --bootstrap-sha256) BOOTSTRAP_SHA256="${2:-}"; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --rollback) ROLLBACK=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -58,6 +64,39 @@ if [ "$UNINSTALL" -eq 1 ]; then
   rm -rf /var/lib/xenon/agent
   systemctl daemon-reload
   exit 0
+fi
+
+if [ -z "$BOOTSTRAP_URL" ] && [ -n "$BOOTSTRAP_SHA256" ]; then
+  fail "--bootstrap-sha256 requires --bootstrap-url"
+fi
+if [ -n "$BOOTSTRAP_URL" ]; then
+  case "$BOOTSTRAP_URL" in http://*|https://*) ;; *) fail "--bootstrap-url must use HTTP(S)" ;; esac
+  printf '%s' "$BOOTSTRAP_URL" | grep -Eq '^https?://[^[:space:]"\\]+$' || \
+    fail "invalid --bootstrap-url"
+  printf '%s' "$BOOTSTRAP_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$' || \
+    fail "invalid --bootstrap-sha256"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for bootstrap installation"
+  bootstrap_file="$(mktemp)"
+  trap 'rm -f "$bootstrap_file"' EXIT INT TERM
+  curl --fail --silent --show-error --location --proto '=http,https' --tlsv1.2 \
+    "$BOOTSTRAP_URL" --output "$bootstrap_file"
+  actual_bootstrap_sha256="$(sha256sum "$bootstrap_file" | awk '{print $1}')"
+  [ "$actual_bootstrap_sha256" = "$(printf '%s' "$BOOTSTRAP_SHA256" | tr 'A-F' 'a-f')" ] || \
+    fail "Agent bootstrap SHA-256 mismatch"
+  manifest_field() {
+    awk -F= -v key="$1" '$1 == key {print substr($0, index($0, "=") + 1)}' "$bootstrap_file"
+  }
+  PANEL_ENDPOINT="$(manifest_field panel_endpoint)"
+  ENROLLMENT_ENDPOINT="$(manifest_field enrollment_endpoint)"
+  SERVER_NAME="$(manifest_field server_name)"
+  BINARY_URL="$(manifest_field binary_url)"
+  BINARY_SHA256_X86_64="$(manifest_field binary_sha256_x86_64)"
+  BINARY_SHA256_AARCH64="$(manifest_field binary_sha256_aarch64)"
+  AGENT_VERSION="$(manifest_field binary_version)"
+  CA_URL="$(manifest_field ca_url)"
+  CA_SHA256="$(manifest_field ca_sha256)"
+  rm -f "$bootstrap_file"
+  trap - EXIT INT TERM
 fi
 
 case "$(uname -m)" in
@@ -116,7 +155,14 @@ if [ "$UPGRADE" -eq 0 ]; then
   if [ -n "$CA_B64" ]; then
     printf '%s' "$CA_B64" | grep -Eq '^[A-Za-z0-9+/=_-]+$' || fail "invalid --ca-b64"
   else
-    case "$CA_URL" in https://*) ;; *) fail "--ca-url must use https:// (or pass --ca-b64)" ;; esac
+    case "$CA_URL" in
+      https://*) ;;
+      http://*) [ -n "$CA_SHA256" ] || fail "HTTP --ca-url requires --ca-sha256" ;;
+      *) fail "--ca-url must use HTTP(S), or pass --ca-b64" ;;
+    esac
+  fi
+  if [ -n "$CA_SHA256" ]; then
+    printf '%s' "$CA_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$' || fail "invalid --ca-sha256"
   fi
   printf '%s' "$PANEL_ENDPOINT" | grep -Eq '^https://[^[:space:]"\\]+$' || fail "invalid --panel"
   printf '%s' "$ENROLLMENT_ENDPOINT" | grep -Eq '^https://[^[:space:]"\\]+$' || fail "invalid --enrollment"
@@ -145,6 +191,17 @@ download() {
   else
     fail "curl or wget is required"
   fi
+}
+
+download_ca() {
+  case "$CA_URL" in
+    https://*) download "$CA_URL" "$1" ;;
+    http://*)
+      command -v curl >/dev/null 2>&1 || fail "curl is required for a pinned HTTP CA download"
+      curl --fail --silent --show-error --location --proto '=http' \
+        "$CA_URL" --output "$1"
+      ;;
+  esac
 }
 
 tmp_dir="$(mktemp -d)"
@@ -200,7 +257,12 @@ if [ -n "$CA_B64" ]; then
   grep -q "BEGIN CERTIFICATE" "$tmp_dir/panel-ca.crt" || \
     fail "--ca-b64 does not decode to a PEM certificate"
 else
-  download "$CA_URL" "$tmp_dir/panel-ca.crt"
+  download_ca "$tmp_dir/panel-ca.crt"
+fi
+if [ -n "$CA_SHA256" ]; then
+  actual_ca_sha256="$(sha256sum "$tmp_dir/panel-ca.crt" | awk '{print $1}')"
+  [ "$actual_ca_sha256" = "$(printf '%s' "$CA_SHA256" | tr 'A-F' 'a-f')" ] || \
+    fail "Panel CA SHA-256 mismatch"
 fi
 
 install -d -o root -g root -m 0755 /var/lib/xenon

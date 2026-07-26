@@ -24,6 +24,8 @@ struct HttpState {
     runtime: Arc<RwLock<RuntimeState>>,
     database: Database,
     rate_limiter: Arc<RateLimiter>,
+    agent_ca_pem: Option<Arc<Vec<u8>>>,
+    agent_bootstrap: Option<Arc<Vec<u8>>>,
 }
 
 pub async fn serve(
@@ -31,9 +33,13 @@ pub async fn serve(
     config: SubscriptionHttpConfig,
     runtime: Arc<RwLock<RuntimeState>>,
     database: Database,
+    agent_ca_pem: Option<Vec<u8>>,
+    agent_bootstrap_manifest: Option<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/agent-ca.crt", get(agent_ca))
+        .route("/agent-bootstrap", get(agent_bootstrap))
         .route("/sub/:token", get(subscription))
         .route("/sub/:token/vless", get(subscription_vless))
         .route("/sub/:token/mihomo", get(subscription_mihomo))
@@ -41,6 +47,8 @@ pub async fn serve(
         .with_state(HttpState {
             runtime,
             database,
+            agent_ca_pem: agent_ca_pem.map(Arc::new),
+            agent_bootstrap: agent_bootstrap_manifest.map(Arc::new),
             rate_limiter: Arc::new(RateLimiter::new(
                 config.requests_per_minute_per_ip,
                 config.requests_per_minute_per_token,
@@ -67,6 +75,32 @@ pub async fn serve(
         .await?;
     }
     Ok(())
+}
+
+async fn agent_ca(State(state): State<HttpState>) -> Response {
+    let Some(pem) = state.agent_ca_pem else {
+        return (StatusCode::NOT_FOUND, "Agent CA is not configured\n").into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-pem-file"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, pem.as_ref().clone()).into_response()
+}
+
+async fn agent_bootstrap(State(state): State<HttpState>) -> Response {
+    let Some(manifest) = state.agent_bootstrap else {
+        return (StatusCode::NOT_FOUND, "Agent bootstrap is not configured\n").into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, manifest.as_ref().clone()).into_response()
 }
 
 async fn healthz(State(state): State<HttpState>) -> impl IntoResponse {
@@ -567,8 +601,8 @@ fn render_error(error: impl std::fmt::Display) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        charged_bytes, render_subscription, subscription_response, userinfo_header, ClientNode,
-        HttpState, RateLimiter, SubscriptionFormat,
+        agent_bootstrap, agent_ca, charged_bytes, render_subscription, subscription_response,
+        userinfo_header, ClientNode, HttpState, RateLimiter, SubscriptionFormat,
     };
     use crate::{secrets::sha256_hex, RuntimeState};
     use axum::{body::to_bytes, http::StatusCode};
@@ -689,6 +723,8 @@ mod tests {
             runtime: Arc::new(RwLock::new(RuntimeState::default())),
             database,
             rate_limiter: Arc::new(RateLimiter::new(120, 60)),
+            agent_ca_pem: None,
+            agent_bootstrap: None,
         };
         let client_ip: IpAddr = "127.0.0.1".parse().expect("client IP");
         let response = subscription_response(
@@ -756,5 +792,47 @@ mod tests {
         assert!(token_limiter.allow(first_ip, "shared-hash"));
         assert!(token_limiter.allow(second_ip, "shared-hash"));
         assert!(!token_limiter.allow(third_ip, "shared-hash"));
+    }
+
+    #[tokio::test]
+    async fn serves_public_agent_ca() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database = Database::connect(temp.path().join("panel.db"))
+            .await
+            .expect("database");
+        let state = HttpState {
+            runtime: Arc::new(RwLock::new(RuntimeState::default())),
+            database,
+            rate_limiter: Arc::new(RateLimiter::new(120, 60)),
+            agent_ca_pem: Some(Arc::new(b"-----BEGIN CERTIFICATE-----\ntest\n".to_vec())),
+            agent_bootstrap: None,
+        };
+        let response = agent_ca(axum::extract::State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("CA body");
+        assert_eq!(body, b"-----BEGIN CERTIFICATE-----\ntest\n".as_slice());
+    }
+
+    #[tokio::test]
+    async fn serves_public_agent_bootstrap_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let database = Database::connect(temp.path().join("panel.db"))
+            .await
+            .expect("database");
+        let state = HttpState {
+            runtime: Arc::new(RwLock::new(RuntimeState::default())),
+            database,
+            rate_limiter: Arc::new(RateLimiter::new(120, 60)),
+            agent_ca_pem: None,
+            agent_bootstrap: Some(Arc::new(b"panel_endpoint=https://panel.test\n".to_vec())),
+        };
+        let response = agent_bootstrap(axum::extract::State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bootstrap body");
+        assert_eq!(body, b"panel_endpoint=https://panel.test\n".as_slice());
     }
 }

@@ -4,6 +4,7 @@ use chrono::Utc;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
+    style::Print,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
@@ -1041,6 +1042,17 @@ fn agent_install_notice(
     summary: &str,
 ) -> anyhow::Result<String> {
     if agent_install.enabled {
+        if !agent_install.bootstrap_url.is_empty() {
+            let bootstrap_sha256 = sha256_hex(agent_install.bootstrap_manifest().as_bytes());
+            return Ok(format!(
+                "{summary}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --node '{}' --token '{}' --bootstrap-url '{}' --bootstrap-sha256 '{}'",
+                agent_install.script_url,
+                node_id,
+                token,
+                agent_install.bootstrap_url,
+                bootstrap_sha256,
+            ));
+        }
         let binary_args = agent_binary_args(agent_install)?;
         let ca_arg = agent_ca_arg(agent_install)?;
         Ok(format!(
@@ -1099,6 +1111,13 @@ fn agent_binary_args(agent_install: &AgentInstallConfig) -> anyhow::Result<Strin
 }
 
 fn agent_ca_arg(agent_install: &AgentInstallConfig) -> anyhow::Result<String> {
+    if !agent_install.ca_url.is_empty() {
+        let mut args = format!("--ca-url '{}'", agent_install.ca_url);
+        if !agent_install.ca_sha256.is_empty() {
+            args.push_str(&format!(" --ca-sha256 '{}'", agent_install.ca_sha256));
+        }
+        return Ok(args);
+    }
     if !agent_install.ca_path.is_empty() {
         let pem = std::fs::read(&agent_install.ca_path)
             .with_context(|| format!("read agent CA at {}", agent_install.ca_path))?;
@@ -1110,9 +1129,6 @@ fn agent_ca_arg(agent_install: &AgentInstallConfig) -> anyhow::Result<String> {
             "--ca-b64 '{}'",
             base64::engine::general_purpose::STANDARD.encode(pem)
         ));
-    }
-    if !agent_install.ca_url.is_empty() {
-        return Ok(format!("--ca-url '{}'", agent_install.ca_url));
     }
     anyhow::bail!("agent_install needs ca_path or ca_url")
 }
@@ -1616,6 +1632,7 @@ fn run_blocking(
     let mut unbind_binding_id = String::new();
     let mut pending_host_notice = None::<String>;
     let mut host_create_result = String::new();
+    let mut host_command_copied = false;
     let mut dismissed_notice = None::<String>;
     let mut last_seen_notice = String::new();
     let result = loop {
@@ -1627,6 +1644,7 @@ fn run_blocking(
             .is_some_and(|previous| !raw_notice.is_empty() && raw_notice != previous)
         {
             host_create_result.clone_from(&raw_notice);
+            host_command_copied = false;
             pending_host_notice = None;
             page = Page::HostCreateResult;
         }
@@ -1665,7 +1683,7 @@ fn run_blocking(
             Page::HostCreateResult => {
                 let area = draw_primary_shell(frame, &snapshot, 3);
                 draw_nodes(frame, area, &snapshot, selected_node);
-                draw_host_create_result(frame, &host_create_result);
+                draw_host_create_result(frame, &host_create_result, host_command_copied);
             }
             Page::ProxyNodeCreate => {
                 let area = draw_primary_shell(frame, &snapshot, 2);
@@ -1873,6 +1891,19 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::HostCreateResult => match key.code {
+                        KeyCode::Char('y') => {
+                            if let Some((_, command)) = host_create_result.split_once("; install: ")
+                            {
+                                use base64::Engine as _;
+                                let encoded = base64::engine::general_purpose::STANDARD
+                                    .encode(command.as_bytes());
+                                execute!(
+                                    terminal.backend_mut(),
+                                    Print(format!("\x1b]52;c;{encoded}\x07"))
+                                )?;
+                                host_command_copied = true;
+                            }
+                        }
                         KeyCode::Enter | KeyCode::Esc => {
                             dismissed_notice = Some(host_create_result.clone());
                             page = Page::Hosts;
@@ -3736,7 +3767,7 @@ fn draw_host_create(frame: &mut ratatui::Frame<'_>, form: &HostFormState) {
     draw_host_form(frame, form, "添加主机", "创建并生成 Agent 安装命令");
 }
 
-fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str) {
+fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str, copied: bool) {
     let command_result = result.split_once("; install: ");
     let disabled_result = result.split_once("; installer-disabled; ");
     let summary = command_result
@@ -3794,7 +3825,16 @@ fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str) {
         "主机创建结果",
         result.starts_with("operation failed:"),
     );
-    modal_body_and_hint(frame, inner, body, "[Enter/Esc] 关闭  [q] 退出");
+    let hint = if command_result.is_some() {
+        if copied {
+            "已发送到终端剪贴板  [Enter/Esc] 关闭  [q] 退出"
+        } else {
+            "[y] 复制命令  [Enter/Esc] 关闭  [q] 退出"
+        }
+    } else {
+        "[Enter/Esc] 关闭  [q] 退出"
+    };
+    modal_body_and_hint(frame, inner, body, hint);
 }
 
 fn draw_host_form(frame: &mut ratatui::Frame<'_>, form: &HostFormState, title: &str, action: &str) {
@@ -4136,6 +4176,7 @@ mod tests {
                 super::draw_host_create_result(
                     frame,
                     "created host host-a; install: curl -fsSL https://example.test | sudo bash",
+                    false,
                 );
                 super::draw_proxy_node_create(frame, &snapshot, &proxy_node_form);
             })
@@ -4286,12 +4327,13 @@ mod tests {
                       --panel 'https://panel.example:50051' --node 'host-a' --token 'secret'";
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
         terminal
-            .draw(|frame| super::draw_host_create_result(frame, result))
+            .draw(|frame| super::draw_host_create_result(frame, result, false))
             .expect("result render");
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("created host host-a"), "{rendered}");
         assert!(rendered.contains("install-agent.sh"), "{rendered}");
         assert!(rendered.contains("--token 'secret'"), "{rendered}");
+        assert!(rendered.contains("[y]"), "{rendered}");
     }
 
     #[test]
@@ -4300,7 +4342,7 @@ mod tests {
                       token: one-time-secret; panel: 127.0.0.1:50051";
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
         terminal
-            .draw(|frame| super::draw_host_create_result(frame, result))
+            .draw(|frame| super::draw_host_create_result(frame, result, false))
             .expect("result render");
         let rendered = rendered_text(&terminal);
         let compact = rendered.replace(' ', "");
@@ -4536,7 +4578,9 @@ mod tests {
             binary_sha256_aarch64: "b".repeat(64),
             binary_version: "0.1.0".into(),
             ca_url: "https://downloads.test/panel-ca.crt".into(),
+            ca_sha256: "c".repeat(64),
             ca_path: String::new(),
+            bootstrap_url: "http://panel.test:18181/agent-bootstrap".into(),
             panel_endpoint: "https://panel.test:50051".into(),
             enrollment_endpoint: "https://panel.test:50052".into(),
             server_name: "panel.test".into(),
@@ -4552,10 +4596,13 @@ mod tests {
         )
         .await
         .expect("create node");
-        assert!(notice.contains("--panel 'https://panel.test:50051'"));
-        assert!(notice.contains("--binary-sha256"));
-        assert!(notice.contains("--agent-version '0.1.0'"));
+        assert!(notice.contains("--bootstrap-url"));
+        assert!(notice.contains("--bootstrap-sha256"));
+        assert!(!notice.contains("--binary-sha256"));
+        assert!(!notice.contains("--agent-version"));
+        assert!(!notice.contains("--ca-b64"));
         assert!(!notice.contains("example.invalid"));
+        assert!(notice.len() < 600, "install command is too long: {notice}");
         let upgrade = agent_upgrade_command(&install, "node-a").expect("upgrade command");
         assert!(upgrade.contains("--upgrade"));
         assert!(upgrade.contains("--rollback"));

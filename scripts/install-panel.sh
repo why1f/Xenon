@@ -167,7 +167,14 @@ if [ -f "$tls_dir/clients-ca.key" ]; then
   chown xenon:xenon "$tls_dir/clients-ca.key"
   chmod 0600 "$tls_dir/clients-ca.key"
 fi
+server_ca_sha256="$(sha256sum "$tls_dir/server-ca.crt" | awk '{print $1}')"
+printf '%s' "$server_ca_sha256" | grep -Eq '^[0-9a-f]{64}$' || \
+  fail "bad Panel CA digest"
 
+config_existed=0
+if [ -f /etc/xenon/xenon.toml ]; then
+  config_existed=1
+fi
 if [ ! -f /etc/xenon/xenon.toml ]; then
   cat > /etc/xenon/xenon.toml <<EOF
 grpc_addr = "0.0.0.0:50051"
@@ -213,12 +220,15 @@ certificate_valid_days = 90
 
 [agent_install]
 enabled = true
-script_url = "https://raw.githubusercontent.com/${repository}/main/scripts/install-agent.sh"
+script_url = "https://raw.githubusercontent.com/${repository}/${version}/scripts/install-agent.sh"
 binary_url = "${release_url}/xenon-agent-linux-{arch}"
 binary_sha256_x86_64 = "${agent_sha_x86_64}"
 binary_sha256_aarch64 = "${agent_sha_aarch64}"
 binary_version = "${agent_version}"
+ca_url = "http://${host}:18181/agent-ca.crt"
+ca_sha256 = "${server_ca_sha256}"
 ca_path = "/etc/xenon/tls/server-ca.crt"
+bootstrap_url = "http://${host}:18181/agent-bootstrap"
 panel_endpoint = "https://${host}:50051"
 enrollment_endpoint = "https://${host}:50052"
 server_name = "${host}"
@@ -255,6 +265,53 @@ else
   else
     printf 'Keeping existing /etc/xenon/xenon.toml.\n'
   fi
+fi
+
+if [ "$config_existed" -eq 1 ] && awk -v repository="$repository" '
+  /^\[/ { in_agent_install = ($0 == "[agent_install]") }
+  in_agent_install && $0 == "enabled = true" { enabled = 1 }
+  in_agent_install && index($0, "github.com/" repository "/releases/download/") { release = 1 }
+  in_agent_install && $0 == "ca_path = \"/etc/xenon/tls/server-ca.crt\"" { installer_ca = 1 }
+  END { exit !(enabled && release && installer_ca) }
+' /etc/xenon/xenon.toml; then
+  config_tmp="$(mktemp /etc/xenon/xenon.toml.tmp.XXXXXX)"
+  awk \
+    -v script_url="https://raw.githubusercontent.com/${repository}/${version}/scripts/install-agent.sh" \
+    -v binary_url="${release_url}/xenon-agent-linux-{arch}" \
+    -v sha_x86_64="$agent_sha_x86_64" \
+    -v sha_aarch64="$agent_sha_aarch64" \
+    -v binary_version="$agent_version" \
+    -v ca_url="http://${host}:18181/agent-ca.crt" \
+    -v ca_sha256="$server_ca_sha256" \
+    -v bootstrap_url="http://${host}:18181/agent-bootstrap" \
+    -v panel_endpoint="https://${host}:50051" \
+    -v enrollment_endpoint="https://${host}:50052" \
+    -v server_name="$host" '
+      $0 == "[agent_install]" {
+        print "[agent_install]"
+        print "enabled = true"
+        print "script_url = \"" script_url "\""
+        print "binary_url = \"" binary_url "\""
+        print "binary_sha256_x86_64 = \"" sha_x86_64 "\""
+        print "binary_sha256_aarch64 = \"" sha_aarch64 "\""
+        print "binary_version = \"" binary_version "\""
+        print "ca_url = \"" ca_url "\""
+        print "ca_sha256 = \"" ca_sha256 "\""
+        print "ca_path = \"/etc/xenon/tls/server-ca.crt\""
+        print "bootstrap_url = \"" bootstrap_url "\""
+        print "panel_endpoint = \"" panel_endpoint "\""
+        print "enrollment_endpoint = \"" enrollment_endpoint "\""
+        print "server_name = \"" server_name "\""
+        replacing = 1
+        next
+      }
+      replacing && /^\[/ { replacing = 0 }
+      !replacing { print }
+    ' /etc/xenon/xenon.toml > "$config_tmp"
+  chown root:xenon "$config_tmp"
+  chmod 0640 "$config_tmp"
+  mv "$config_tmp" /etc/xenon/xenon.toml
+  printf 'Updated installer-managed Agent release metadata to %s.\n' "$version"
 fi
 
 install -o root -g root -m 0644 \
