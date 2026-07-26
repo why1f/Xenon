@@ -71,11 +71,18 @@ fn parse_command() -> anyhow::Result<Command> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
-
     let command = parse_command()?;
+    let env_headless = std::env::var("PANEL_HEADLESS").is_ok_and(|value| value == "1");
+    let interactive_tui = matches!(&command, Command::Run { headless: false }) && !env_headless;
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()));
+    if interactive_tui {
+        // Writing tracing output to stdout/stderr corrupts ratatui's alternate screen.
+        subscriber.with_writer(std::io::sink).init();
+    } else {
+        subscriber.init();
+    }
+
     let config_path = std::env::var("XENON_CONFIG").unwrap_or_else(|_| "xenon.toml".into());
     let config = PanelConfig::load(&config_path).await?;
     match command {

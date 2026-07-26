@@ -51,7 +51,7 @@ Copy-Item agent.toml.example agent.toml
 cargo run -p xenon-agent
 ```
 
-Panel TUI 顶部使用数字键 `1` 到 `5` 或 `Tab` 在“仪表盘 / 用户 / 节点 / 主机 / 日志”间切换。主机页的 `n` 创建 VPS/Agent 身份并生成一次性安装命令，`e` 编辑主机名称和地址，`u` 显示升级/回滚命令，`r` 吊销 Agent 证书。节点页的 `n` 在已有主机上保存协议节点，表单内用左右键切换协议类型，`e` 编辑、`d` 启停、大写 `D` 逻辑删除。总览和用户主页始终展示 Xray 流量；网卡绑定只决定 `subscription-userinfo` 的流量来源。用户详情页可编辑订阅节点、额度、倍率、周期、到期时间和状态，并管理网卡绑定与凭据轮换。`q` 退出。健康检查：
+Panel TUI 顶部使用数字键 `1` 到 `5` 或 `Tab` 在“仪表盘 / 用户 / 节点 / 主机 / 日志”间切换，大写 `R` 立即刷新。用户、节点和主机页统一用 `a` 新建。主机创建后会显示一次性 Agent 安装命令；已有主机可按 `i` 重新签发一小时有效的注册 Token 和安装命令，`e` 编辑主机名称和地址，`u` 显示升级/回滚命令，`r` 吊销 Agent 证书。节点表单内用左右键切换协议类型，`e` 编辑、`d` 启停、大写 `D` 逻辑删除。总览和用户主页始终展示 Xray 流量；网卡绑定只决定 `subscription-userinfo` 的流量来源。用户详情页按 `n` 打开节点勾选器，也可编辑额度、倍率、周期、到期时间和状态，并管理网卡绑定与凭据轮换。`q` 退出。健康检查：
 
 ```text
 GET http://127.0.0.1:18181/healthz
@@ -163,7 +163,7 @@ curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-pa
 
 安装器会下载最新 Release、生成自签服务端 CA/证书与 Agent 客户端 CA、写入启用 mTLS 和 Enrollment 的 `/etc/xenon/xenon.toml`，并以 systemd 服务启动主控。有域名时用 `sudo XENON_HOST=panel.example.com bash` 指定；否则自动使用公网 IPv4。
 
-装好后执行 `sudo xenon-tui` 进入 TUI，切换到“主机 [4]”并按 `n` 创建主机，把打印的一行命令拷贝到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA。Agent 注册上线后，再到“节点 [3]”为该主机配置协议节点。
+装好后执行 `sudo xenon-tui` 进入 TUI，切换到“主机 [4]”并按 `a` 创建主机，把弹窗中的命令放到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA。关闭过弹窗时，在主机页选中该主机按 `i` 即可重新生成。Agent 注册上线后，再到“节点 [3]”为该主机配置协议节点。
 
 需要放行端口：`50051`（gRPC mTLS）、`50052`（Enrollment）、`18181`（订阅 HTTP）以及各节点的 Xray 端口。
 

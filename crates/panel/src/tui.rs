@@ -183,6 +183,7 @@ struct EditSubscriptionInput {
 }
 
 enum TuiCommand {
+    Refresh,
     CreateSubscription(CreateSubscriptionInput),
     CreateHost(CreateHostInput),
     CreateProxyNode(ProxyNodeInput),
@@ -234,6 +235,7 @@ enum TuiCommand {
         status: String,
     },
     DeleteProxyNode(String),
+    ShowAgentInstall(String),
     ShowAgentUpgrade(String),
     DeleteHost(String),
 }
@@ -285,6 +287,15 @@ pub async fn run(
                     break;
                 };
                 let result = match command {
+                    TuiCommand::Refresh => {
+                        if let Some(user_id) = user_detail
+                            .as_ref()
+                            .map(|detail| detail.user.id.clone())
+                        {
+                            user_detail = database.user_detail(&user_id).await?;
+                        }
+                        Ok(String::new())
+                    }
                     TuiCommand::CreateSubscription(input) => create_subscription(&database, &subscription_base_url, input).await,
                     TuiCommand::CreateHost(input) => create_host(&database, &grpc_addr, &agent_install, input).await,
                     TuiCommand::CreateProxyNode(input) => create_proxy_node(&database, input).await,
@@ -399,6 +410,9 @@ pub async fn run(
                         set_proxy_node_status(&database, &proxy_node_id, &status).await
                     }
                     TuiCommand::DeleteProxyNode(proxy_node_id) => delete_proxy_node(&database, &proxy_node_id).await,
+                    TuiCommand::ShowAgentInstall(node_id) => {
+                        create_host_registration(&database, &grpc_addr, &agent_install, &node_id).await
+                    }
                     TuiCommand::ShowAgentUpgrade(node_id) => {
                         agent_upgrade_command(&agent_install, &node_id)
                     }
@@ -983,11 +997,54 @@ async fn create_host(
         )
         .await
         .context("store host and registration token")?;
+    agent_install_notice(
+        grpc_addr,
+        agent_install,
+        &node_id,
+        &token,
+        &format!("created host {node_id}"),
+    )
+}
+
+async fn create_host_registration(
+    database: &Database,
+    grpc_addr: &str,
+    agent_install: &AgentInstallConfig,
+    node_id: &str,
+) -> anyhow::Result<String> {
+    let now = Utc::now().timestamp();
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    database
+        .create_registration_token(&models::NewRegistrationToken {
+            id: Uuid::now_v7().to_string(),
+            node_id: node_id.to_string(),
+            token_hash: sha256_hex(token.as_bytes()),
+            expires_at: now + 3600,
+            created_at: now,
+        })
+        .await
+        .context("store Agent registration token")?;
+    agent_install_notice(
+        grpc_addr,
+        agent_install,
+        node_id,
+        &token,
+        &format!("generated Agent install command for host {node_id}"),
+    )
+}
+
+fn agent_install_notice(
+    grpc_addr: &str,
+    agent_install: &AgentInstallConfig,
+    node_id: &str,
+    token: &str,
+    summary: &str,
+) -> anyhow::Result<String> {
     if agent_install.enabled {
         let binary_args = agent_binary_args(agent_install)?;
         let ca_arg = agent_ca_arg(agent_install)?;
         Ok(format!(
-            "created host {node_id}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' {binary_args} {ca_arg}",
+            "{summary}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' {binary_args} {ca_arg}",
             agent_install.script_url,
             agent_install.panel_endpoint,
             agent_install.enrollment_endpoint,
@@ -997,7 +1054,7 @@ async fn create_host(
         ))
     } else {
         Ok(format!(
-            "created host {node_id}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
+            "{summary}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
         ))
     }
 }
@@ -1091,6 +1148,7 @@ enum Page {
     NicCreate,
     NicUnbindConfirm,
     SubscriptionEdit,
+    SubscriptionNodes,
     SubscriptionRotateConfirm,
     HostEdit,
     HostDeleteConfirm,
@@ -1132,6 +1190,44 @@ struct SubscriptionEditFormState {
     starts_at: i64,
     current_cycle_start: i64,
     active: usize,
+}
+
+#[derive(Default)]
+struct NodeAssignmentState {
+    cursor: usize,
+    selected_ids: Vec<String>,
+}
+
+impl NodeAssignmentState {
+    fn from_snapshot(snapshot: &TuiSnapshot, selected_subscription: usize) -> Option<Self> {
+        let detail = snapshot.user_detail.as_ref()?;
+        let subscription = detail.subscriptions.get(selected_subscription)?;
+        Some(Self {
+            cursor: 0,
+            selected_ids: detail
+                .proxy_nodes
+                .iter()
+                .filter(|assignment| assignment.subscription_id == subscription.id)
+                .map(|assignment| assignment.proxy_node_id.clone())
+                .collect(),
+        })
+    }
+
+    fn contains(&self, node_id: &str) -> bool {
+        self.selected_ids.iter().any(|selected| selected == node_id)
+    }
+
+    fn toggle(&mut self, node: &models::ProxyNodeRecord) {
+        if let Some(index) = self
+            .selected_ids
+            .iter()
+            .position(|selected| selected == &node.id)
+        {
+            self.selected_ids.remove(index);
+        } else if node.status == "active" {
+            self.selected_ids.push(node.id.clone());
+        }
+    }
 }
 
 impl SubscriptionEditFormState {
@@ -1251,6 +1347,11 @@ impl HostFormState {
 const PROXY_NODE_PROFILES: [&str; 4] = ["vless-reality", "vless-encryption", "vless-ws", "ss-2022"];
 
 impl ProxyNodeFormState {
+    const REALITY_FIELDS: [usize; 9] = [0, 1, 2, 3, 4, 5, 8, 9, 10];
+    const ENCRYPTION_FIELDS: [usize; 6] = [0, 1, 2, 3, 4, 7];
+    const WS_FIELDS: [usize; 6] = [0, 1, 2, 3, 4, 6];
+    const SS_FIELDS: [usize; 5] = [0, 1, 2, 3, 4];
+
     fn new(snapshot: &TuiSnapshot) -> Self {
         Self {
             fields: [
@@ -1333,6 +1434,31 @@ impl ProxyNodeFormState {
         } else {
             (self.profile + PROXY_NODE_PROFILES.len() - 1) % PROXY_NODE_PROFILES.len()
         };
+        self.active = self
+            .active
+            .min(self.visible_fields().len().saturating_sub(1));
+    }
+
+    fn visible_fields(&self) -> &'static [usize] {
+        match self.profile {
+            0 => &Self::REALITY_FIELDS,
+            1 => &Self::ENCRYPTION_FIELDS,
+            2 => &Self::WS_FIELDS,
+            _ => &Self::SS_FIELDS,
+        }
+    }
+
+    fn active_field(&self) -> usize {
+        self.visible_fields()[self.active.min(self.visible_fields().len() - 1)]
+    }
+
+    fn move_focus(&mut self, forward: bool) {
+        let count = self.visible_fields().len();
+        self.active = if forward {
+            (self.active + 1) % count
+        } else {
+            (self.active + count - 1) % count
+        };
     }
 }
 
@@ -1392,6 +1518,7 @@ fn run_blocking(
     let mut proxy_node_form = ProxyNodeFormState::new(&snapshot_rx.borrow());
     let mut nic_form = NicBindingFormState::from_snapshot(&snapshot_rx.borrow(), None);
     let mut subscription_form = None;
+    let mut node_assignment = NodeAssignmentState::default();
     let mut rotate_kind = RotateKind::Token;
     let mut revoke_node_id = String::new();
     let mut revoke_returns_to_nodes = false;
@@ -1431,6 +1558,9 @@ fn run_blocking(
         }
         selected_node = selected_node.min(snapshot.nodes.len().saturating_sub(1));
         selected_proxy_node = selected_proxy_node.min(snapshot.proxy_nodes.len().saturating_sub(1));
+        node_assignment.cursor = node_assignment
+            .cursor
+            .min(snapshot.proxy_nodes.len().saturating_sub(1));
         terminal.draw(|frame| match page {
             Page::Dashboard => {
                 let area = draw_primary_shell(frame, &snapshot, 0);
@@ -1490,6 +1620,10 @@ fn run_blocking(
                 if let Some(form) = subscription_form.as_ref() {
                     draw_subscription_edit(frame, form);
                 }
+            }
+            Page::SubscriptionNodes => {
+                draw_user_detail(frame, &snapshot, selected_subscription);
+                draw_node_assignment(frame, &snapshot, selected_subscription, &node_assignment);
             }
             Page::SubscriptionRotateConfirm => {
                 draw_user_detail(frame, &snapshot, selected_subscription);
@@ -1553,14 +1687,14 @@ fn run_blocking(
                             page = Page::Hosts;
                         }
                         KeyCode::Char('5') => page = Page::Logs,
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('a') | KeyCode::Char('c') => {
                             form = FormState::from_snapshot(&snapshot);
                             page = Page::Create;
                         }
-                        KeyCode::Char('n') => {
-                            proxy_node_form = ProxyNodeFormState::new(&snapshot);
-                            page = Page::ProxyNodeCreate;
-                        }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         KeyCode::Char('r') => {
                             revoke_returns_to_nodes = false;
                             revoke_node_id = snapshot
@@ -1584,10 +1718,14 @@ fn run_blocking(
                             page = Page::Hosts;
                         }
                         KeyCode::Char('5') => page = Page::Logs,
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('a') | KeyCode::Char('c') => {
                             form = FormState::from_snapshot(&snapshot);
                             page = Page::Create;
                         }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         KeyCode::Up => {
                             selected_user = selected_user.saturating_sub(1);
                         }
@@ -1662,12 +1800,8 @@ fn run_blocking(
                     },
                     Page::ProxyNodeCreate => match key.code {
                         KeyCode::Esc => page = Page::Nodes,
-                        KeyCode::Tab | KeyCode::Down => {
-                            proxy_node_form.active = (proxy_node_form.active + 1) % 11
-                        }
-                        KeyCode::BackTab | KeyCode::Up => {
-                            proxy_node_form.active = (proxy_node_form.active + 10) % 11
-                        }
+                        KeyCode::Tab | KeyCode::Down => proxy_node_form.move_focus(true),
+                        KeyCode::BackTab | KeyCode::Up => proxy_node_form.move_focus(false),
                         KeyCode::Left => proxy_node_form.cycle_profile(false),
                         KeyCode::Right => proxy_node_form.cycle_profile(true),
                         KeyCode::Enter => {
@@ -1680,10 +1814,10 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            proxy_node_form.fields[proxy_node_form.active].pop();
+                            proxy_node_form.fields[proxy_node_form.active_field()].pop();
                         }
                         KeyCode::Char(value) => {
-                            proxy_node_form.fields[proxy_node_form.active].push(value)
+                            proxy_node_form.fields[proxy_node_form.active_field()].push(value)
                         }
                         _ => {}
                     },
@@ -1729,6 +1863,20 @@ fn run_blocking(
                                 page = Page::SubscriptionEdit;
                             }
                         }
+                        KeyCode::Char('n') => {
+                            subscription_form = SubscriptionEditFormState::from_snapshot(
+                                &snapshot,
+                                selected_subscription,
+                            );
+                            if subscription_form.is_some() {
+                                node_assignment = NodeAssignmentState::from_snapshot(
+                                    &snapshot,
+                                    selected_subscription,
+                                )
+                                .unwrap_or_default();
+                                page = Page::SubscriptionNodes;
+                            }
+                        }
                         KeyCode::Char('T') => {
                             rotate_kind = RotateKind::Token;
                             page = Page::SubscriptionRotateConfirm;
@@ -1748,7 +1896,7 @@ fn run_blocking(
                                 }
                             }
                         }
-                        KeyCode::Char('R') => {
+                        KeyCode::Char('r') => {
                             if let Some(detail) = snapshot.user_detail.as_ref() {
                                 if let Some(subscription) =
                                     detail.subscriptions.get(selected_subscription)
@@ -1765,6 +1913,10 @@ fn run_blocking(
                                 }
                             }
                         }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         _ => {}
                     },
                     Page::NicBindings => match key.code {
@@ -1819,7 +1971,7 @@ fn run_blocking(
                                 }
                             }
                         }
-                        KeyCode::Char('R') => {
+                        KeyCode::Char('r') => {
                             if let Some(detail) = snapshot.user_detail.as_ref() {
                                 if let Some(binding) = detail
                                     .nic_bindings
@@ -1845,6 +1997,10 @@ fn run_blocking(
                                 }
                             }
                         }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         _ => {}
                     },
                     Page::NicCreate => match key.code {
@@ -1936,6 +2092,43 @@ fn run_blocking(
                         }
                         _ => {}
                     },
+                    Page::SubscriptionNodes => match key.code {
+                        KeyCode::Esc => page = Page::UserDetail,
+                        KeyCode::Up => {
+                            node_assignment.cursor = node_assignment.cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down if !snapshot.proxy_nodes.is_empty() => {
+                            node_assignment.cursor =
+                                (node_assignment.cursor + 1).min(snapshot.proxy_nodes.len() - 1);
+                        }
+                        KeyCode::Char(' ') => {
+                            if let Some(node) = snapshot.proxy_nodes.get(node_assignment.cursor) {
+                                node_assignment.toggle(node);
+                            }
+                        }
+                        KeyCode::Enter if !node_assignment.selected_ids.is_empty() => {
+                            if let (Some(detail), Some(form)) =
+                                (snapshot.user_detail.as_ref(), subscription_form.as_mut())
+                            {
+                                form.fields[1] = node_assignment.selected_ids.join(",");
+                                if command_tx
+                                    .blocking_send(TuiCommand::UpdateSubscription {
+                                        user_id: detail.user.id.clone(),
+                                        input: form.input(),
+                                    })
+                                    .is_err()
+                                {
+                                    break Ok(());
+                                }
+                            }
+                            page = Page::UserDetail;
+                        }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
+                        _ => {}
+                    },
                     Page::SubscriptionRotateConfirm => match key.code {
                         KeyCode::Esc => page = Page::UserDetail,
                         KeyCode::Enter => {
@@ -1976,10 +2169,14 @@ fn run_blocking(
                             selected_proxy_node =
                                 (selected_proxy_node + 1).min(snapshot.proxy_nodes.len() - 1);
                         }
-                        KeyCode::Char('n') => {
+                        KeyCode::Char('a') | KeyCode::Char('n') => {
                             proxy_node_form = ProxyNodeFormState::new(&snapshot);
                             page = Page::ProxyNodeCreate;
                         }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         KeyCode::Char('e') | KeyCode::Enter => {
                             if let Some(node) = snapshot.proxy_nodes.get(selected_proxy_node) {
                                 edit_proxy_node_id = node.id.clone();
@@ -2023,10 +2220,14 @@ fn run_blocking(
                         KeyCode::Down if !snapshot.nodes.is_empty() => {
                             selected_node = (selected_node + 1).min(snapshot.nodes.len() - 1);
                         }
-                        KeyCode::Char('n') => {
+                        KeyCode::Char('a') | KeyCode::Char('n') => {
                             host_form = HostFormState::default();
                             page = Page::HostCreate;
                         }
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         KeyCode::Char('e') | KeyCode::Enter => {
                             if let Some(node) = snapshot.nodes.get(selected_node) {
                                 edit_host_id = node.id.clone();
@@ -2057,6 +2258,17 @@ fn run_blocking(
                                 revoke_returns_to_nodes = true;
                                 revoke_node_id = node.id.clone();
                                 page = Page::Revoke;
+                            }
+                        }
+                        KeyCode::Char('i') => {
+                            if let Some(node) = snapshot.nodes.get(selected_node) {
+                                pending_host_notice = Some(last_seen_notice.clone());
+                                if command_tx
+                                    .blocking_send(TuiCommand::ShowAgentInstall(node.id.clone()))
+                                    .is_err()
+                                {
+                                    break Ok(());
+                                }
                             }
                         }
                         KeyCode::Char('u') => {
@@ -2118,12 +2330,8 @@ fn run_blocking(
                     },
                     Page::ProxyNodeEdit => match key.code {
                         KeyCode::Esc => page = Page::Nodes,
-                        KeyCode::Tab | KeyCode::Down => {
-                            proxy_node_form.active = (proxy_node_form.active + 1) % 11;
-                        }
-                        KeyCode::BackTab | KeyCode::Up => {
-                            proxy_node_form.active = (proxy_node_form.active + 10) % 11;
-                        }
+                        KeyCode::Tab | KeyCode::Down => proxy_node_form.move_focus(true),
+                        KeyCode::BackTab | KeyCode::Up => proxy_node_form.move_focus(false),
                         KeyCode::Left => proxy_node_form.cycle_profile(false),
                         KeyCode::Right => proxy_node_form.cycle_profile(true),
                         KeyCode::Enter => {
@@ -2139,10 +2347,10 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            proxy_node_form.fields[proxy_node_form.active].pop();
+                            proxy_node_form.fields[proxy_node_form.active_field()].pop();
                         }
                         KeyCode::Char(value) => {
-                            proxy_node_form.fields[proxy_node_form.active].push(value)
+                            proxy_node_form.fields[proxy_node_form.active_field()].push(value)
                         }
                         _ => {}
                     },
@@ -2167,6 +2375,10 @@ fn run_blocking(
                         KeyCode::Char('2') => page = Page::Users,
                         KeyCode::Char('3') => page = Page::Nodes,
                         KeyCode::Char('4') => page = Page::Hosts,
+                        KeyCode::Char('R') => match command_tx.blocking_send(TuiCommand::Refresh) {
+                            Ok(()) => {}
+                            Err(_) => break Ok(()),
+                        },
                         _ => {}
                     },
                 }
@@ -2236,11 +2448,11 @@ fn draw_primary_shell(
 
     let (footer, footer_style) = if snapshot.notice.is_empty() {
         let keys = match selected_tab {
-            0 => "[Tab/2] 用户  [3] 节点  [4] 主机  [5] 日志  [c] 新建用户  [q] 退出",
-            1 => "[↑↓] 选择  [Enter] 详情  [c] 新建用户  [3] 节点  [4] 主机  [q] 退出",
-            2 => "[↑↓] 选择  [Enter/e] 编辑  [n] 新建  [d] 启停  [D] 删除  [4/Tab] 主机",
-            3 => "[↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建主机  [5] 日志",
-            _ => "[1-4/Tab] 切换页面  [q] 退出",
+            0 => "[1-5/Tab] 切换  [a] 新建用户  [R] 刷新  [q] 退出",
+            1 => "[↑↓] 选择  [Enter] 详情  [a] 新建用户  [R] 刷新  [3] 节点  [4] 主机",
+            2 => "[↑↓] 选择  [Enter/e] 编辑  [a] 新建  [d] 启停  [D] 删除  [R] 刷新",
+            3 => "[↑↓] 选择  [a] 新建  [i] 安装命令  [e] 编辑  [d] 启停  [u] 升级  [R] 刷新",
+            _ => "[1-4/Tab] 切换页面  [R] 刷新  [q] 退出",
         };
         (keys, Style::default().fg(Color::DarkGray))
     } else {
@@ -3103,10 +3315,99 @@ fn draw_user_detail(
         areas[1],
     );
     frame.render_widget(
-        Paragraph::new("Up/Down Select   e Edit   b NIC   R Reset   T Token   U UUID   Esc Back")
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
+        Paragraph::new(
+            "↑↓ 选择  n 分配节点  e 编辑  b 网卡  r 重置流量  R 刷新  T Token  U UUID  Esc 返回",
+        )
+        .style(Style::default().fg(Color::Green))
+        .block(Block::default().borders(Borders::ALL).title("Keys")),
         areas[2],
+    );
+}
+
+fn draw_node_assignment(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &TuiSnapshot,
+    selected_subscription: usize,
+    state: &NodeAssignmentState,
+) {
+    let subscription_name = snapshot
+        .user_detail
+        .as_ref()
+        .and_then(|detail| detail.subscriptions.get(selected_subscription))
+        .map_or("-", |subscription| subscription.name.as_str());
+    let visible_rows = 12_usize;
+    let start = state.cursor.saturating_sub(visible_rows.saturating_sub(1));
+    let mut body = vec![
+        Line::from(vec![
+            Span::styled("订阅  ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate(subscription_name, 36),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::default(),
+    ];
+    if snapshot.proxy_nodes.is_empty() {
+        body.push(Line::from("暂无节点，请先在节点页按 a 创建。"));
+    } else {
+        body.push(Line::from(Span::styled(
+            "    节点                     协议              主机               状态",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for (index, node) in snapshot
+            .proxy_nodes
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_rows)
+        {
+            let checked = state.contains(&node.id);
+            let selected = index == state.cursor;
+            let marker = if checked { "[x]" } else { "[ ]" };
+            let protocol = format!("{}/{}/{}", node.protocol, node.transport, node.security);
+            let line = format!(
+                "{} {:<24} {:<17} {:<18} {}",
+                marker,
+                truncate(&node.name, 24),
+                truncate(&protocol, 17),
+                truncate(&node.host_name, 18),
+                node.status,
+            );
+            body.push(Line::from(Span::styled(
+                line,
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if node.status != "active" {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )));
+        }
+    }
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        format!("已选择 {} 个节点", state.selected_ids.len()),
+        Style::default().fg(if state.selected_ids.is_empty() {
+            Color::Red
+        } else {
+            Color::Green
+        }),
+    )));
+    let inner = modal_area(
+        frame,
+        92,
+        (body.len() as u16 + 3).min(22),
+        "分配订阅节点",
+        false,
+    );
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        "[↑↓] 选择  [Space] 勾选  [Enter] 保存  [R] 刷新  [Esc] 取消",
     );
 }
 
@@ -3177,7 +3478,7 @@ fn draw_nic_bindings(
         areas[1],
     );
     frame.render_widget(
-        Paragraph::new("Up/Down Select   a Add   R Reset cycle   D Unbind   Esc Back")
+        Paragraph::new("↑↓ 选择  a 添加  r 重置周期  R 刷新  D 解绑  Esc 返回")
             .style(Style::default().fg(Color::Green))
             .block(Block::default().borders(Borders::ALL).title("Keys")),
         areas[2],
@@ -3425,45 +3726,70 @@ fn draw_proxy_node_form(
     action: &str,
 ) {
     let labels = [
-        "所属主机 ID",
-        "节点名称 *必填",
-        "Xray 监听端口",
-        "发布地址 (可选)",
-        "发布端口 (可选)",
-        "Server Name",
-        "WebSocket Path",
-        "VLESS Encryption",
+        "所属主机 ID *必填",
+        "Tag *必填",
+        "端口 *必填 (默认 443)",
+        "订阅发布地址 (可选)",
+        "订阅发布端口 (可选)",
+        "server_name (SNI)",
+        "path *必填",
+        "VLESS Encryption (可选)",
         "Reality 公钥",
-        "Reality short ID",
+        "Reality short_id",
         "Reality 指纹",
     ];
-    let mut body = vec![Line::from(vec![
-        Span::raw("协议  "),
-        Span::styled(
-            format!("< {} >", PROXY_NODE_PROFILES[form.profile]),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ←/→ 切换", Style::default().fg(Color::DarkGray)),
-    ])];
-    body.extend(form_lines(&labels, &form.fields, form.active));
-    body.push(Line::from(Span::styled(
-        "主机: ",
-        Style::default().fg(Color::Yellow),
-    )));
-    for host in snapshot.nodes.iter().take(4) {
-        body.push(Line::from(format!("  {} ({})", host.id, host.name)));
+    let mut body = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(
+                format!(" {:<26}", "协议 (←/→ 切换)"),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(" ◀ {} ▶ ", PROXY_NODE_PROFILES[form.profile]),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::default(),
+    ];
+    for (position, field_index) in form.visible_fields().iter().copied().enumerate() {
+        let selected = position == form.active;
+        let value = &form.fields[field_index];
+        body.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<26}", labels[field_index]),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(" {}{} ", value, if selected { "_" } else { "" }),
+                if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+        ]));
+        body.push(Line::default());
+    }
+    if let Some(host) = snapshot.nodes.iter().find(|host| host.id == form.fields[0]) {
+        body.push(Line::from(Span::styled(
+            format!("  主机: {}  {}", host.name, host.landing_host),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     body.push(Line::from(Span::styled(
-        if form.profile == 3 {
-            "SS2022 尚缺少凭据与 Agent 下发支持，当前不可创建"
-        } else {
-            "Reality 私钥只应在 Agent 端生成和保存"
+        match form.profile {
+            0 => "  Reality: 私钥必须留在 Agent；当前需填写客户端公钥/short_id",
+            1 => "  VLESS Encryption: 订阅 UUID 由用户订阅自动生成",
+            2 => "  VLESS WS: 只显示 WebSocket path，无 Reality 字段",
+            _ => "  SS2022: Agent 密钥生成与下发尚未完成，当前不可创建",
         },
         Style::default().fg(Color::DarkGray),
     )));
-    let inner = modal_area(frame, 78, 24, title, false);
+    let height = (body.len() as u16 + 3).min(28);
+    let inner = modal_area(frame, 86, height, title, false);
     modal_body_and_hint(
         frame,
         inner,
@@ -3596,10 +3922,11 @@ fn format_bytes(value: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_upgrade_command, create_host, create_proxy_node, create_subscription, format_bytes,
-        format_reset_policy, CreateHostInput, CreateSubscriptionInput, FormState, HostFormState,
-        NicBindingFormState, NicRateTracker, ProxyNodeFormState, ProxyNodeInput,
-        SubscriptionEditFormState, TuiSnapshot,
+        agent_upgrade_command, create_host, create_host_registration, create_proxy_node,
+        create_subscription, format_bytes, format_reset_policy, CreateHostInput,
+        CreateSubscriptionInput, FormState, HostFormState, NicBindingFormState, NicRateTracker,
+        NodeAssignmentState, ProxyNodeFormState, ProxyNodeInput, SubscriptionEditFormState,
+        TuiSnapshot,
     };
     use ratatui::{backend::TestBackend, style::Color, Terminal};
     use xenon_storage::{models, Database};
@@ -3662,6 +3989,7 @@ mod tests {
             current_cycle_start: 0,
             active: 0,
         };
+        let node_assignment = NodeAssignmentState::default();
         let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
         terminal
             .draw(|frame| {
@@ -3685,6 +4013,7 @@ mod tests {
                 super::draw_nic_create(frame, &snapshot, &nic_form);
                 super::draw_nic_unbind_confirm(frame, &snapshot, "binding");
                 super::draw_subscription_edit(frame, &subscription_form);
+                super::draw_node_assignment(frame, &snapshot, 0, &node_assignment);
                 super::draw_subscription_rotate_confirm(
                     frame,
                     &snapshot,
@@ -3934,6 +4263,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_node_form_only_exposes_fields_for_the_selected_protocol() {
+        let snapshot = TuiSnapshot::default();
+        let mut form = ProxyNodeFormState::new(&snapshot);
+        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 5, 8, 9, 10]);
+
+        form.cycle_profile(true);
+        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 7]);
+        form.cycle_profile(true);
+        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 6]);
+        form.cycle_profile(true);
+        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn node_assignment_only_adds_active_nodes() {
+        let mut state = NodeAssignmentState::default();
+        let mut node = models::ProxyNodeRecord {
+            id: "proxy-a".into(),
+            host_id: "host-a".into(),
+            name: "Reality".into(),
+            host_name: "Host A".into(),
+            landing_host: "203.0.113.10".into(),
+            listen_port: 443,
+            publish_host: None,
+            publish_port: None,
+            protocol: "vless".into(),
+            transport: "tcp".into(),
+            security: "reality".into(),
+            server_name: Some("example.com".into()),
+            websocket_path: None,
+            vless_encryption: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            reality_fingerprint: None,
+            status: "disabled".into(),
+        };
+        state.toggle(&node);
+        assert!(state.selected_ids.is_empty());
+
+        node.status = "active".into();
+        state.toggle(&node);
+        assert!(state.contains("proxy-a"));
+        state.toggle(&node);
+        assert!(!state.contains("proxy-a"));
+    }
+
     #[tokio::test]
     async fn creates_host_and_registration_token_without_a_protocol_node() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -3984,6 +4360,22 @@ mod tests {
             .await
             .expect("tokens");
         assert_eq!(token_count, 1);
+
+        let regenerated = create_host_registration(
+            &database,
+            "127.0.0.1:50051",
+            &install,
+            &database.list_nodes().await.expect("nodes")[0].id,
+        )
+        .await
+        .expect("regenerate install command");
+        assert!(regenerated.contains("generated Agent install command"));
+        assert!(regenerated.contains("--token '"));
+        let token_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM registration_tokens")
+            .fetch_one(database.pool())
+            .await
+            .expect("tokens");
+        assert_eq!(token_count, 2);
     }
 
     #[tokio::test]

@@ -1077,12 +1077,12 @@ impl Database {
         node: &models::NewProxyNode,
         status: &str,
     ) -> Result<(), StorageError> {
-        validate_proxy_node(node)?;
         if !matches!(status, "active" | "disabled") {
             return Err(StorageError::Validation(
                 "invalid initial Xray node status".into(),
             ));
         }
+        validate_proxy_node(node, status == "active")?;
         let mut tx = self.pool.begin().await?;
         let host_active = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
@@ -1144,6 +1144,17 @@ impl Database {
         proxy_node_id: &str,
         node: &models::UpdateProxyNode,
     ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query_as::<_, (String, String)>(
+            "SELECT host_id, status FROM proxy_nodes WHERE id = ? AND status != 'deleted'",
+        )
+        .bind(proxy_node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((previous_host, current_status)) = previous else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
         validate_proxy_node_fields(
             proxy_node_id,
             &node.host_id,
@@ -1158,18 +1169,8 @@ impl Database {
             node.websocket_path.as_deref(),
             node.reality_public_key.as_deref(),
             node.reality_short_id.as_deref(),
+            current_status == "active",
         )?;
-        let mut tx = self.pool.begin().await?;
-        let previous_host = sqlx::query_scalar::<_, String>(
-            "SELECT host_id FROM proxy_nodes WHERE id = ? AND status != 'deleted'",
-        )
-        .bind(proxy_node_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(previous_host) = previous_host else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
         let host_active = sqlx::query_scalar::<_, i64>(
             "SELECT EXISTS(
                 SELECT 1 FROM nodes WHERE id = ? AND management_status != 'deleted'
@@ -1250,6 +1251,33 @@ impl Database {
             tx.rollback().await?;
             return Ok(false);
         };
+        if status == "active" {
+            let deployable = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proxy_nodes
+                    WHERE id = ? AND status != 'deleted'
+                      AND protocol != 'shadowsocks'
+                      AND NOT (
+                        security = 'reality' AND (
+                          COALESCE(reality_public_key, '') = '' OR
+                          COALESCE(reality_short_id, '') = ''
+                        )
+                      )
+                      AND NOT (
+                        transport = 'ws' AND COALESCE(websocket_path, '') = ''
+                      )
+                 )",
+            )
+            .bind(proxy_node_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if deployable != 1 {
+                tx.rollback().await?;
+                return Err(StorageError::Validation(
+                    "Xray node is missing generated credentials or protocol support".into(),
+                ));
+            }
+        }
         sqlx::query("UPDATE proxy_nodes SET status = ?, updated_at = ? WHERE id = ?")
             .bind(status)
             .bind(now)
@@ -2924,7 +2952,10 @@ fn validate_managed_host(id: &str, name: &str, landing_host: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_proxy_node(node: &models::NewProxyNode) -> Result<(), StorageError> {
+fn validate_proxy_node(
+    node: &models::NewProxyNode,
+    require_reality_client_keys: bool,
+) -> Result<(), StorageError> {
     validate_proxy_node_fields(
         &node.id,
         &node.host_id,
@@ -2939,6 +2970,7 @@ fn validate_proxy_node(node: &models::NewProxyNode) -> Result<(), StorageError> 
         node.websocket_path.as_deref(),
         node.reality_public_key.as_deref(),
         node.reality_short_id.as_deref(),
+        require_reality_client_keys,
     )
 }
 
@@ -2957,6 +2989,7 @@ fn validate_proxy_node_fields(
     websocket_path: Option<&str>,
     reality_public_key: Option<&str>,
     reality_short_id: Option<&str>,
+    require_reality_client_keys: bool,
 ) -> Result<(), StorageError> {
     if id.trim().is_empty()
         || host_id.trim().is_empty()
@@ -3001,7 +3034,8 @@ fn validate_proxy_node_fields(
                     "TLS and Reality nodes require server_name".into(),
                 ));
             }
-            if security == "reality"
+            if require_reality_client_keys
+                && security == "reality"
                 && (missing_text(reality_public_key) || missing_text(reality_short_id))
             {
                 return Err(StorageError::Validation(
@@ -3222,6 +3256,47 @@ mod tests {
         assert_eq!(ws.name, "US WebSocket Updated");
         assert_eq!(ws.listen_port, 9443);
         assert_eq!(ws.status, "disabled");
+    }
+
+    #[tokio::test]
+    async fn disabled_reality_node_can_wait_for_agent_generated_credentials() {
+        let (_temp, database) = test_database().await;
+        database
+            .ensure_development_node("host-reality", 10)
+            .await
+            .expect("managed host");
+        database
+            .create_proxy_node_with_status(
+                &models::NewProxyNode {
+                    id: "proxy-pending-reality".into(),
+                    host_id: "host-reality".into(),
+                    name: "Pending Reality".into(),
+                    listen_port: 8443,
+                    publish_host: None,
+                    publish_port: None,
+                    protocol: "vless".into(),
+                    transport: "tcp".into(),
+                    security: "reality".into(),
+                    server_name: Some("www.example.com".into()),
+                    websocket_path: None,
+                    vless_encryption: None,
+                    reality_public_key: None,
+                    reality_short_id: None,
+                    reality_fingerprint: Some("chrome".into()),
+                    created_at: 11,
+                },
+                "disabled",
+            )
+            .await
+            .expect("store pending Reality node");
+
+        let error = database
+            .set_proxy_node_status("proxy-pending-reality", "active", 12)
+            .await
+            .expect_err("pending Reality node must not activate");
+        assert!(error
+            .to_string()
+            .contains("missing generated credentials or protocol support"));
     }
 
     #[tokio::test]

@@ -2,10 +2,23 @@
 
 ## 0.1.0-alpha.9 - 2026-07-26
 
+### Added
+
+- Add `R` manual refresh across the five primary TUI pages and user management views.
+- Add a dedicated subscription node picker: press `n` in user detail, move with arrow keys, toggle active Xray nodes with Space, and save with Enter.
+- Allow an existing managed host to issue a fresh one-hour Agent registration token and display its installation command with `i`.
+
+### Changed
+
+- Standardize user, Xray node, and managed-host creation on the `a` shortcut while retaining the old create keys for compatibility.
+- Redesign the Xray node form around left/right protocol switching and protocol-specific fields, following the compact sb-manager layout without introducing sing-box.
+- Permit disabled Reality node records to wait for Agent-generated public parameters, while refusing activation until required credentials exist.
+
 ### Fixed
 
 - Show the complete one-time Agent installation command in a persistent, wrapping TUI dialog after creating a managed host instead of briefly clipping it in the one-line footer.
 - Preserve one-time operation results across periodic TUI refreshes until the operator dismisses them.
+- Keep interactive tracing output out of the alternate screen so server log lines no longer remain mixed into TUI tables and footers.
 
 ## 0.1.0-alpha.8 - 2026-07-26
 
