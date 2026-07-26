@@ -66,7 +66,7 @@ GET /sub/<token>/mihomo       Mihomo YAML
 GET /sub/<token>/sing-box     Sing-box JSON
 ```
 
-`[subscription_http]` 可启用原生 HTTPS，也可在反向代理终止 TLS 时保持明文监听在回环或私网地址。`public_base_url` 控制 TUI 生成的外部订阅地址；服务按来源 IP 和 Token 分别限流，访问日志只记录 Token 哈希前 12 位，不记录完整 Token、UUID 或订阅正文。
+`[subscription_http]` 可启用原生 HTTPS，也可在反向代理终止 TLS 时保持明文监听在回环或私网地址。仅在明确接受订阅 Token 经公网 HTTP 传输的风险时，才设置 `allow_public_plaintext = true`；生产一键安装器为兼容普通订阅客户端会显式启用它。`public_base_url` 控制 TUI 生成的外部订阅地址；服务按来源 IP 和 Token 分别限流，访问日志只记录 Token 哈希前 12 位，不记录完整 Token、UUID 或订阅正文。
 
 `[traffic_retention]` 默认保留 30 天 Xray 原始事件和网卡快照、7 天系统快照；小时和天聚合的保留天数设为 `0` 表示长期保留。计费周期聚合不会被自动清理。
 

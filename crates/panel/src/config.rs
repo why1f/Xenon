@@ -105,6 +105,8 @@ impl Default for TrafficRetentionConfig {
 pub struct SubscriptionHttpConfig {
     #[serde(default)]
     pub tls_enabled: bool,
+    #[serde(default)]
+    pub allow_public_plaintext: bool,
     #[serde(default = "default_subscription_cert_path")]
     pub cert_path: String,
     #[serde(default = "default_subscription_key_path")]
@@ -134,6 +136,7 @@ impl Default for SubscriptionHttpConfig {
     fn default() -> Self {
         Self {
             tls_enabled: false,
+            allow_public_plaintext: false,
             cert_path: default_subscription_cert_path(),
             key_path: default_subscription_key_path(),
             public_base_url: String::new(),
@@ -318,9 +321,13 @@ impl PanelConfig {
             .http_addr
             .parse()
             .map_err(|error| anyhow::anyhow!("invalid http_addr {}: {error}", self.http_addr))?;
-        if !self.subscription_http.tls_enabled && !is_local_or_private(http_addr) {
+        if !self.subscription_http.tls_enabled
+            && !self.subscription_http.allow_public_plaintext
+            && !is_local_or_private(http_addr)
+        {
             anyhow::bail!(
-                "http_addr must be loopback or private when subscription HTTPS is disabled"
+                "http_addr must be loopback or private when subscription HTTPS is disabled; \
+                 set subscription_http.allow_public_plaintext = true to explicitly allow public HTTP"
             );
         }
         if self.subscription_http.tls_enabled {
@@ -535,6 +542,19 @@ mod tests {
         };
         let error = config.validate().await.expect_err("public plaintext");
         assert!(error.to_string().contains("loopback or private"));
+    }
+
+    #[tokio::test]
+    async fn accepts_explicitly_allowed_public_plaintext_subscription_listener() {
+        let mut config = PanelConfig {
+            http_addr: "0.0.0.0:18181".into(),
+            ..PanelConfig::default()
+        };
+        config.subscription_http.allow_public_plaintext = true;
+        config
+            .validate()
+            .await
+            .expect("explicit public plaintext opt-in");
     }
 
     #[tokio::test]

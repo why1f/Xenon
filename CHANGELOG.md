@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.12 - 2026-07-26
+
+### Fixed
+
+- Make the production installer explicitly opt in to its public plaintext subscription listener so the generated Panel configuration passes validation.
+- Migrate the exact legacy installer-generated subscription HTTP configuration on upgrade while preserving custom reverse-proxy configurations.
+
 ## 0.1.0-alpha.11 - 2026-07-26
 
 ### Fixed

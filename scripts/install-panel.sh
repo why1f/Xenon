@@ -168,6 +168,7 @@ database_path = "/var/lib/xenon/panel/xenon.db"
 
 [subscription_http]
 tls_enabled = false
+allow_public_plaintext = true
 public_base_url = "http://${host}:18181"
 requests_per_minute_per_ip = 120
 requests_per_minute_per_token = 60
@@ -217,7 +218,35 @@ EOF
   chown root:xenon /etc/xenon/xenon.toml
   chmod 0640 /etc/xenon/xenon.toml
 else
-  printf 'Keeping existing /etc/xenon/xenon.toml.\n'
+  if grep -Fxq 'http_addr = "0.0.0.0:18181"' /etc/xenon/xenon.toml && \
+    awk '
+      /^\[/ { in_subscription = ($0 == "[subscription_http]") }
+      in_subscription && $0 == "tls_enabled = false" { plaintext = 1 }
+      in_subscription && $0 ~ /^public_base_url = "http:\/\/[^\"]+:18181"$/ { public_url = 1 }
+      END { exit !(plaintext && public_url) }
+    ' /etc/xenon/xenon.toml && \
+    ! awk '
+      /^\[/ { in_subscription = ($0 == "[subscription_http]") }
+      in_subscription && $0 ~ /^allow_public_plaintext[[:space:]]*=/ { found = 1 }
+      END { exit !found }
+    ' /etc/xenon/xenon.toml; then
+    config_tmp="$(mktemp /etc/xenon/xenon.toml.tmp.XXXXXX)"
+    awk '
+      /^\[/ { in_subscription = ($0 == "[subscription_http]") }
+      in_subscription && $0 == "tls_enabled = false" {
+        print
+        print "allow_public_plaintext = true"
+        next
+      }
+      { print }
+    ' /etc/xenon/xenon.toml > "$config_tmp"
+    chown root:xenon "$config_tmp"
+    chmod 0640 "$config_tmp"
+    mv "$config_tmp" /etc/xenon/xenon.toml
+    printf 'Migrated the legacy installer subscription HTTP configuration.\n'
+  else
+    printf 'Keeping existing /etc/xenon/xenon.toml.\n'
+  fi
 fi
 
 install -o root -g root -m 0644 \

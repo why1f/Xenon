@@ -6,6 +6,8 @@ database_path = "data/xenon.db"
 [subscription_http]
 # Enable native HTTPS, or leave disabled behind a TLS reverse proxy on loopback/private IP.
 tls_enabled = false
+# Explicitly opt in only when intentionally serving subscription tokens over public HTTP.
+allow_public_plaintext = false
 cert_path = "/etc/xenon/tls/subscription.crt"
 key_path = "/etc/xenon/tls/subscription.key"
 # Set this to the externally reachable origin/base path used in generated subscription URLs.
