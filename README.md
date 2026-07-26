@@ -160,11 +160,11 @@ xenon-linux-aarch64.tar.gz.sha256
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh | sudo bash
 ```
 
-引导脚本默认下载 `v0.1.0-alpha.5`，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
+引导脚本默认下载最新 Release，自动识别架构并验证 Release 中的 SHA-256。也可以显式指定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/bootstrap-test.sh \
-  | sudo XENON_VERSION=v0.1.0-alpha.5 bash
+  | sudo XENON_VERSION=v0.1.0-alpha.6 bash
 ```
 
 也可以从 [GitHub Releases](https://github.com/why1f/Xenon/releases) 手动下载对应架构的压缩包；包内 `scripts/install-test.sh` 可同时安装 Xenon 和 Agent：

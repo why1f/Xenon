@@ -29,7 +29,14 @@ case "$(uname -m)" in
 esac
 
 repository="${XENON_REPOSITORY:-why1f/Xenon}"
-version="${XENON_VERSION:-v0.1.0-alpha.5}"
+version="${XENON_VERSION:-}"
+if [ -z "$version" ]; then
+  version="$(curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+    "https://api.github.com/repos/${repository}/releases?per_page=1" |
+    grep -o '"tag_name": *"[^"]*"' | head -n 1 | cut -d '"' -f 4)" || true
+  [ -n "$version" ] || \
+    fail "unable to determine the latest release; set XENON_VERSION explicitly"
+fi
 artifact="xenon-linux-${architecture}"
 archive="${artifact}.tar.gz"
 checksum="${archive}.sha256"
