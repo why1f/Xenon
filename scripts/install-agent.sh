@@ -127,6 +127,11 @@ wait_for_service() {
   return 1
 }
 
+start_agent_service() {
+  systemctl reset-failed xenon-agent.service >/dev/null 2>&1 || true
+  systemctl start xenon-agent.service
+}
+
 if [ "$ROLLBACK" -eq 1 ]; then
   previous="/usr/local/lib/xenon-agent/xenon-agent.previous"
   current="/usr/local/bin/xenon-agent"
@@ -136,7 +141,7 @@ if [ "$ROLLBACK" -eq 1 ]; then
   install -o root -g root -m 0755 "$current" "$swap"
   systemctl stop xenon-agent.service
   install -o root -g root -m 0755 "$previous" "$current"
-  if systemctl start xenon-agent.service && wait_for_service; then
+  if start_agent_service && wait_for_service; then
     install -o root -g root -m 0755 "$swap" "$previous"
     rm -f "$swap"
     printf 'Agent rollback completed.\n'
@@ -145,7 +150,7 @@ if [ "$ROLLBACK" -eq 1 ]; then
   systemctl stop xenon-agent.service >/dev/null 2>&1 || true
   install -o root -g root -m 0755 "$swap" "$current"
   rm -f "$swap"
-  systemctl start xenon-agent.service || true
+  start_agent_service || true
   fail "rollback candidate failed; original Agent was restored"
 fi
 
@@ -230,13 +235,13 @@ if [ "$UPGRADE" -eq 1 ]; then
   install -o root -g root -m 0755 "$current" "$previous"
   systemctl stop xenon-agent.service
   install -o root -g root -m 0755 "$tmp_dir/xenon-agent" "$current"
-  if systemctl start xenon-agent.service && wait_for_service; then
+  if start_agent_service && wait_for_service; then
     printf 'Agent upgraded to %s. Previous binary: %s\n' "$candidate_version" "$previous"
     exit 0
   fi
   systemctl stop xenon-agent.service >/dev/null 2>&1 || true
   install -o root -g root -m 0755 "$previous" "$current"
-  if systemctl start xenon-agent.service && wait_for_service; then
+  if start_agent_service && wait_for_service; then
     fail "upgrade to $candidate_version failed; previous Agent was restored"
   fi
   fail "upgrade failed and previous Agent could not be started"
@@ -349,7 +354,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now xenon-agent.service
+systemctl enable xenon-agent.service
+start_agent_service
 
 for _ in $(seq 1 30); do
   if grep -Eq '^registration_token = ""$' /var/lib/xenon/agent/agent.toml; then
@@ -358,4 +364,6 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
+systemctl status xenon-agent.service --no-pager >&2 || true
+journalctl -u xenon-agent.service -n 30 --no-pager >&2 || true
 fail "Agent did not enroll within 30 seconds; inspect journalctl -u xenon-agent"

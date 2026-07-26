@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.16 - 2026-07-26
+
+### Fixed
+
+- Clear systemd's failed/start-limit state before every Agent install, upgrade, rollback, or repair start so an old crash loop cannot block the repaired service.
+- Print current systemd status and recent Agent journal entries automatically when enrollment times out.
+
 ## 0.1.0-alpha.15 - 2026-07-26
 
 ### Fixed
