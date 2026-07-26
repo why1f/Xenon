@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.10 - 2026-07-26
+
+### Changed
+
+- Rework the Xray node editor into a focused sb-manager-style form: protocol and managed host are row-level selectors, and left/right only changes the currently selected option.
+- Reduce protocol forms to connection essentials. Publish overrides and Reality client parameters are no longer entered in the TUI; existing hidden values remain intact when editing.
+- Keep subscription UUID generation automatic and generate Reality short IDs internally instead of exposing credential fields.
+- Replace the repeated raw Agent registration result with a concise explanation when `[agent_install]` is disabled.
+
+### Fixed
+
+- Accept the production installer's per-architecture Agent SHA-256 values and local CA path when validating `[agent_install]`.
+- Update the production installer hint to use `a` for managed-host creation.
+
 ## 0.1.0-alpha.9 - 2026-07-26
 
 ### Added

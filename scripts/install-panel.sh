@@ -225,7 +225,7 @@ systemctl is-active --quiet xenon.service || \
 
 printf '\nXenon Panel %s installed for host %s.\n' "$version" "$host"
 printf 'Open the TUI:            sudo xenon-tui\n'
-printf 'Add a node/agent:        press [n] in the TUI, then run the printed\n'
+printf 'Add a managed host:      press [a] on the Host page, then run the printed\n'
 printf '                         one-line install command on the target Linux VPS.\n'
 printf 'Required open ports:     50051 (gRPC mTLS), 50052 (enrollment), 18181 (subscriptions)\n'
 printf 'Config:                  /etc/xenon/xenon.toml\n'

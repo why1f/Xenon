@@ -458,7 +458,6 @@ impl PanelConfig {
             for (name, value) in [
                 ("script_url", &self.agent_install.script_url),
                 ("binary_url", &self.agent_install.binary_url),
-                ("ca_url", &self.agent_install.ca_url),
                 ("panel_endpoint", &self.agent_install.panel_endpoint),
                 (
                     "enrollment_endpoint",
@@ -472,14 +471,26 @@ impl PanelConfig {
                     anyhow::bail!("agent_install {name} must be a safe HTTPS URL");
                 }
             }
-            if self.agent_install.binary_sha256.len() != 64
-                || !self
-                    .agent_install
-                    .binary_sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            if !self.agent_install.ca_url.is_empty()
+                && (!self.agent_install.ca_url.starts_with("https://")
+                    || self.agent_install.ca_url.contains(char::is_whitespace)
+                    || self.agent_install.ca_url.contains(['\"', '\'', '\\']))
             {
-                anyhow::bail!("agent_install binary_sha256 must be 64 hex characters");
+                anyhow::bail!("agent_install ca_url must be a safe HTTPS URL");
+            }
+            if self.agent_install.ca_url.is_empty() && self.agent_install.ca_path.is_empty() {
+                anyhow::bail!("agent_install needs ca_url or ca_path");
+            }
+            let valid_hash = |value: &str| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            let generic_hash = valid_hash(&self.agent_install.binary_sha256);
+            let architecture_hashes = valid_hash(&self.agent_install.binary_sha256_x86_64)
+                && valid_hash(&self.agent_install.binary_sha256_aarch64);
+            if !generic_hash && !architecture_hashes {
+                anyhow::bail!(
+                    "agent_install needs binary_sha256 or both architecture-specific SHA-256 values"
+                );
             }
             if self.agent_install.binary_version.is_empty()
                 || self.agent_install.binary_version.len() > 64
@@ -514,7 +525,7 @@ fn is_local_or_private(addr: SocketAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::PanelConfig;
+    use super::{AgentInstallConfig, PanelConfig};
 
     #[tokio::test]
     async fn rejects_public_plaintext_subscription_listener() {
@@ -541,5 +552,26 @@ mod tests {
         config.subscription_http.requests_per_minute_per_token = 0;
         let error = config.validate().await.expect_err("zero rate limit");
         assert!(error.to_string().contains("requests_per_minute_per_token"));
+    }
+
+    #[tokio::test]
+    async fn accepts_architecture_specific_agent_hashes() {
+        let config = PanelConfig {
+            agent_install: AgentInstallConfig {
+                enabled: true,
+                script_url: "https://example.com/install-agent.sh".into(),
+                binary_url: "https://example.com/xenon-agent-{arch}".into(),
+                binary_sha256_x86_64: "a".repeat(64),
+                binary_sha256_aarch64: "b".repeat(64),
+                binary_version: "0.1.0-alpha.10".into(),
+                ca_path: "/etc/xenon/tls/server-ca.crt".into(),
+                panel_endpoint: "https://panel.example.com:50051".into(),
+                enrollment_endpoint: "https://panel.example.com:50052".into(),
+                server_name: "panel.example.com".into(),
+                ..AgentInstallConfig::default()
+            },
+            ..PanelConfig::default()
+        };
+        config.validate().await.expect("agent install config");
     }
 }

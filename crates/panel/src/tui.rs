@@ -1002,7 +1002,7 @@ async fn create_host(
         agent_install,
         &node_id,
         &token,
-        &format!("created host {node_id}"),
+        &format!("已创建主机 {node_id}"),
     )
 }
 
@@ -1029,7 +1029,7 @@ async fn create_host_registration(
         agent_install,
         node_id,
         &token,
-        &format!("generated Agent install command for host {node_id}"),
+        &format!("已为主机 {node_id} 签发新的 Agent 注册凭据"),
     )
 }
 
@@ -1054,7 +1054,7 @@ fn agent_install_notice(
         ))
     } else {
         Ok(format!(
-            "{summary}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
+            "{summary}; installer-disabled; token: {token}; panel: {grpc_addr}"
         ))
     }
 }
@@ -1177,6 +1177,16 @@ struct ProxyNodeFormState {
     fields: [String; 11],
     profile: usize,
     active: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyNodeFormItem {
+    Tag,
+    Protocol,
+    Host,
+    Port,
+    ServerName,
+    WebSocketPath,
 }
 
 struct NicBindingFormState {
@@ -1347,10 +1357,32 @@ impl HostFormState {
 const PROXY_NODE_PROFILES: [&str; 4] = ["vless-reality", "vless-encryption", "vless-ws", "ss-2022"];
 
 impl ProxyNodeFormState {
-    const REALITY_FIELDS: [usize; 9] = [0, 1, 2, 3, 4, 5, 8, 9, 10];
-    const ENCRYPTION_FIELDS: [usize; 6] = [0, 1, 2, 3, 4, 7];
-    const WS_FIELDS: [usize; 6] = [0, 1, 2, 3, 4, 6];
-    const SS_FIELDS: [usize; 5] = [0, 1, 2, 3, 4];
+    const REALITY_ITEMS: [ProxyNodeFormItem; 5] = [
+        ProxyNodeFormItem::Tag,
+        ProxyNodeFormItem::Protocol,
+        ProxyNodeFormItem::Host,
+        ProxyNodeFormItem::Port,
+        ProxyNodeFormItem::ServerName,
+    ];
+    const ENCRYPTION_ITEMS: [ProxyNodeFormItem; 4] = [
+        ProxyNodeFormItem::Tag,
+        ProxyNodeFormItem::Protocol,
+        ProxyNodeFormItem::Host,
+        ProxyNodeFormItem::Port,
+    ];
+    const WS_ITEMS: [ProxyNodeFormItem; 5] = [
+        ProxyNodeFormItem::Tag,
+        ProxyNodeFormItem::Protocol,
+        ProxyNodeFormItem::Host,
+        ProxyNodeFormItem::Port,
+        ProxyNodeFormItem::WebSocketPath,
+    ];
+    const SS_ITEMS: [ProxyNodeFormItem; 4] = [
+        ProxyNodeFormItem::Tag,
+        ProxyNodeFormItem::Protocol,
+        ProxyNodeFormItem::Host,
+        ProxyNodeFormItem::Port,
+    ];
 
     fn new(snapshot: &TuiSnapshot) -> Self {
         Self {
@@ -1412,6 +1444,12 @@ impl ProxyNodeFormState {
     }
 
     fn input(&self) -> ProxyNodeInput {
+        let generated_short_id = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>();
         ProxyNodeInput {
             host_id: self.fields[0].clone(),
             name: self.fields[1].clone(),
@@ -1423,8 +1461,16 @@ impl ProxyNodeFormState {
             websocket_path: self.fields[6].clone(),
             vless_encryption: self.fields[7].clone(),
             reality_public_key: self.fields[8].clone(),
-            reality_short_id: self.fields[9].clone(),
-            reality_fingerprint: self.fields[10].clone(),
+            reality_short_id: if self.profile == 0 && self.fields[9].trim().is_empty() {
+                generated_short_id
+            } else {
+                self.fields[9].clone()
+            },
+            reality_fingerprint: if self.profile == 0 {
+                "chrome".into()
+            } else {
+                self.fields[10].clone()
+            },
         }
     }
 
@@ -1436,24 +1482,60 @@ impl ProxyNodeFormState {
         };
         self.active = self
             .active
-            .min(self.visible_fields().len().saturating_sub(1));
+            .min(self.visible_items().len().saturating_sub(1));
     }
 
-    fn visible_fields(&self) -> &'static [usize] {
+    fn visible_items(&self) -> &'static [ProxyNodeFormItem] {
         match self.profile {
-            0 => &Self::REALITY_FIELDS,
-            1 => &Self::ENCRYPTION_FIELDS,
-            2 => &Self::WS_FIELDS,
-            _ => &Self::SS_FIELDS,
+            0 => &Self::REALITY_ITEMS,
+            1 => &Self::ENCRYPTION_ITEMS,
+            2 => &Self::WS_ITEMS,
+            _ => &Self::SS_ITEMS,
         }
     }
 
-    fn active_field(&self) -> usize {
-        self.visible_fields()[self.active.min(self.visible_fields().len() - 1)]
+    fn active_item(&self) -> ProxyNodeFormItem {
+        self.visible_items()[self.active.min(self.visible_items().len() - 1)]
+    }
+
+    fn editable_field(&self) -> Option<usize> {
+        match self.active_item() {
+            ProxyNodeFormItem::Tag => Some(1),
+            ProxyNodeFormItem::Port => Some(2),
+            ProxyNodeFormItem::ServerName => Some(5),
+            ProxyNodeFormItem::WebSocketPath => Some(6),
+            ProxyNodeFormItem::Protocol | ProxyNodeFormItem::Host => None,
+        }
+    }
+
+    fn cycle_host(&mut self, snapshot: &TuiSnapshot, forward: bool) {
+        if snapshot.nodes.is_empty() {
+            self.fields[0].clear();
+            return;
+        }
+        let current = snapshot
+            .nodes
+            .iter()
+            .position(|host| host.id == self.fields[0])
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % snapshot.nodes.len()
+        } else {
+            (current + snapshot.nodes.len() - 1) % snapshot.nodes.len()
+        };
+        self.fields[0].clone_from(&snapshot.nodes[next].id);
+    }
+
+    fn handle_choice(&mut self, snapshot: &TuiSnapshot, forward: bool) {
+        match self.active_item() {
+            ProxyNodeFormItem::Protocol => self.cycle_profile(forward),
+            ProxyNodeFormItem::Host => self.cycle_host(snapshot, forward),
+            _ => {}
+        }
     }
 
     fn move_focus(&mut self, forward: bool) {
-        let count = self.visible_fields().len();
+        let count = self.visible_items().len();
         self.active = if forward {
             (self.active + 1) % count
         } else {
@@ -1802,8 +1884,10 @@ fn run_blocking(
                         KeyCode::Esc => page = Page::Nodes,
                         KeyCode::Tab | KeyCode::Down => proxy_node_form.move_focus(true),
                         KeyCode::BackTab | KeyCode::Up => proxy_node_form.move_focus(false),
-                        KeyCode::Left => proxy_node_form.cycle_profile(false),
-                        KeyCode::Right => proxy_node_form.cycle_profile(true),
+                        KeyCode::Left => proxy_node_form.handle_choice(&snapshot, false),
+                        KeyCode::Right | KeyCode::Char(' ') => {
+                            proxy_node_form.handle_choice(&snapshot, true)
+                        }
                         KeyCode::Enter => {
                             if command_tx
                                 .blocking_send(TuiCommand::CreateProxyNode(proxy_node_form.input()))
@@ -1814,10 +1898,14 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            proxy_node_form.fields[proxy_node_form.active_field()].pop();
+                            if let Some(field) = proxy_node_form.editable_field() {
+                                proxy_node_form.fields[field].pop();
+                            }
                         }
                         KeyCode::Char(value) => {
-                            proxy_node_form.fields[proxy_node_form.active_field()].push(value)
+                            if let Some(field) = proxy_node_form.editable_field() {
+                                proxy_node_form.fields[field].push(value);
+                            }
                         }
                         _ => {}
                     },
@@ -2332,8 +2420,10 @@ fn run_blocking(
                         KeyCode::Esc => page = Page::Nodes,
                         KeyCode::Tab | KeyCode::Down => proxy_node_form.move_focus(true),
                         KeyCode::BackTab | KeyCode::Up => proxy_node_form.move_focus(false),
-                        KeyCode::Left => proxy_node_form.cycle_profile(false),
-                        KeyCode::Right => proxy_node_form.cycle_profile(true),
+                        KeyCode::Left => proxy_node_form.handle_choice(&snapshot, false),
+                        KeyCode::Right | KeyCode::Char(' ') => {
+                            proxy_node_form.handle_choice(&snapshot, true)
+                        }
                         KeyCode::Enter => {
                             if command_tx
                                 .blocking_send(TuiCommand::UpdateProxyNode {
@@ -2347,10 +2437,14 @@ fn run_blocking(
                             page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
-                            proxy_node_form.fields[proxy_node_form.active_field()].pop();
+                            if let Some(field) = proxy_node_form.editable_field() {
+                                proxy_node_form.fields[field].pop();
+                            }
                         }
                         KeyCode::Char(value) => {
-                            proxy_node_form.fields[proxy_node_form.active_field()].push(value)
+                            if let Some(field) = proxy_node_form.editable_field() {
+                                proxy_node_form.fields[field].push(value);
+                            }
                         }
                         _ => {}
                     },
@@ -3643,11 +3737,12 @@ fn draw_host_create(frame: &mut ratatui::Frame<'_>, form: &HostFormState) {
 }
 
 fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str) {
-    let (summary, command) = if let Some((summary, command)) = result.split_once("; install: ") {
-        (summary, Some(command))
-    } else {
-        (result, None)
-    };
+    let command_result = result.split_once("; install: ");
+    let disabled_result = result.split_once("; installer-disabled; ");
+    let summary = command_result
+        .map(|(summary, _)| summary)
+        .or_else(|| disabled_result.map(|(summary, _)| summary))
+        .unwrap_or(result);
     let mut body = vec![
         Line::from(Span::styled(
             summary.to_string(),
@@ -3659,19 +3754,38 @@ fn draw_host_create_result(frame: &mut ratatui::Frame<'_>, result: &str) {
         )),
         Line::default(),
     ];
-    if let Some(command) = command {
+    if let Some((_, command)) = command_result {
         body.push(Line::from(Span::styled(
             "Agent 一键安装命令（包含一次性注册 Token）：",
             Style::default().fg(Color::Yellow),
         )));
         body.push(Line::default());
         body.push(Line::from(command.to_string()));
-    } else if result.contains("installer is not configured") {
+    } else if let Some((_, details)) = disabled_result {
+        let (token, panel) = details
+            .split_once("; panel: ")
+            .map(|(token, panel)| (token.trim_start_matches("token: "), panel))
+            .unwrap_or(("-", "-"));
+        body.push(Line::from(Span::styled(
+            "无法生成一键安装命令",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        body.push(Line::default());
         body.push(Line::from(
-            "未配置 [agent_install]，当前只能显示注册 Token 和 Panel 地址。",
+            "当前配置未启用 [agent_install]；本地 127.0.0.1 地址也不能供远程 VPS 使用。",
+        ));
+        body.push(Line::from(
+            "正式部署请使用 scripts/install-panel.sh，或补全 xenon.toml 的 [agent_install] 后重启 Panel。",
         ));
         body.push(Line::default());
-        body.push(Line::from(result.to_string()));
+        body.push(Line::from(vec![
+            Span::styled(
+                "手工注册 Token（仅显示一次）：",
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(token.to_string()),
+        ]));
+        body.push(Line::from(format!("Panel 当前监听地址：{panel}")));
     }
     let inner = modal_area(
         frame,
@@ -3725,45 +3839,47 @@ fn draw_proxy_node_form(
     title: &str,
     action: &str,
 ) {
-    let labels = [
-        "所属主机 ID *必填",
-        "Tag *必填",
-        "端口 *必填 (默认 443)",
-        "订阅发布地址 (可选)",
-        "订阅发布端口 (可选)",
-        "server_name (SNI)",
-        "path *必填",
-        "VLESS Encryption (可选)",
-        "Reality 公钥",
-        "Reality short_id",
-        "Reality 指纹",
-    ];
-    let mut body = vec![
-        Line::default(),
-        Line::from(vec![
-            Span::styled(
-                format!(" {:<26}", "协议 (←/→ 切换)"),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(
-                format!(" ◀ {} ▶ ", PROXY_NODE_PROFILES[form.profile]),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::default(),
-    ];
-    for (position, field_index) in form.visible_fields().iter().copied().enumerate() {
+    let mut body = vec![Line::default()];
+    for (position, item) in form.visible_items().iter().copied().enumerate() {
         let selected = position == form.active;
-        let value = &form.fields[field_index];
+        let (label, value, is_choice) = match item {
+            ProxyNodeFormItem::Tag => ("Tag *必填", form.fields[1].clone(), false),
+            ProxyNodeFormItem::Protocol => (
+                "协议 (←/→ 切换)",
+                format!("◀ {} ▶", PROXY_NODE_PROFILES[form.profile]),
+                true,
+            ),
+            ProxyNodeFormItem::Host => {
+                let host = snapshot.nodes.iter().find(|host| host.id == form.fields[0]);
+                (
+                    "主机 (←/→ 切换)",
+                    host.map_or_else(
+                        || "◀ 暂无主机 ▶".into(),
+                        |host| {
+                            format!(
+                                "◀ {} · {} ▶",
+                                truncate(&host.name, 18),
+                                truncate(&host.landing_host, 24)
+                            )
+                        },
+                    ),
+                    true,
+                )
+            }
+            ProxyNodeFormItem::Port => ("端口 *必填 (默认 443)", form.fields[2].clone(), false),
+            ProxyNodeFormItem::ServerName => {
+                ("server_name (SNI) *必填", form.fields[5].clone(), false)
+            }
+            ProxyNodeFormItem::WebSocketPath => ("path *必填", form.fields[6].clone(), false),
+        };
+        let cursor = if selected && !is_choice { "_" } else { "" };
         body.push(Line::from(vec![
             Span::styled(
-                format!(" {:<26}", labels[field_index]),
+                format!(" {:<27}", label),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
-                format!(" {}{} ", value, if selected { "_" } else { "" }),
+                format!(" {value}{cursor}  "),
                 if selected {
                     Style::default().fg(Color::Black).bg(Color::Cyan)
                 } else {
@@ -3773,28 +3889,22 @@ fn draw_proxy_node_form(
         ]));
         body.push(Line::default());
     }
-    if let Some(host) = snapshot.nodes.iter().find(|host| host.id == form.fields[0]) {
-        body.push(Line::from(Span::styled(
-            format!("  主机: {}  {}", host.name, host.landing_host),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
     body.push(Line::from(Span::styled(
         match form.profile {
-            0 => "  Reality: 私钥必须留在 Agent；当前需填写客户端公钥/short_id",
-            1 => "  VLESS Encryption: 订阅 UUID 由用户订阅自动生成",
-            2 => "  VLESS WS: 只显示 WebSocket path，无 Reality 字段",
-            _ => "  SS2022: Agent 密钥生成与下发尚未完成，当前不可创建",
+            0 => "  UUID 自动生成；Reality 凭据由 Agent 管理，不在表单中显示",
+            1 => "  UUID 自动生成；只需填写节点连接参数",
+            2 => "  UUID 自动生成；WebSocket 节点只需额外填写 path",
+            _ => "  Shadowsocks 密钥由 Agent 管理，无 SNI / path 字段",
         },
         Style::default().fg(Color::DarkGray),
     )));
-    let height = (body.len() as u16 + 3).min(28);
-    let inner = modal_area(frame, 86, height, title, false);
+    let height = (body.len() as u16 + 3).min(20);
+    let inner = modal_area(frame, 82, height, title, false);
     modal_body_and_hint(
         frame,
         inner,
         body,
-        &format!("[←/→] 协议  [Tab/↑↓] 字段  [Enter] {action}  [Esc] 取消"),
+        &format!("[Tab/↑↓] 选择  [←/→/Space] 切换选项  [Enter] {action}  [Esc] 取消"),
     );
 }
 
@@ -3925,10 +4035,11 @@ mod tests {
         agent_upgrade_command, create_host, create_host_registration, create_proxy_node,
         create_subscription, format_bytes, format_reset_policy, CreateHostInput,
         CreateSubscriptionInput, FormState, HostFormState, NicBindingFormState, NicRateTracker,
-        NodeAssignmentState, ProxyNodeFormState, ProxyNodeInput, SubscriptionEditFormState,
-        TuiSnapshot,
+        NodeAssignmentState, ProxyNodeFormItem, ProxyNodeFormState, ProxyNodeInput,
+        SubscriptionEditFormState, TuiSnapshot,
     };
     use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use uuid::Uuid;
     use xenon_storage::{models, Database};
 
     #[test]
@@ -4183,6 +4294,21 @@ mod tests {
         assert!(rendered.contains("--token 'secret'"), "{rendered}");
     }
 
+    #[test]
+    fn missing_agent_installer_is_explained_without_repeating_the_token() {
+        let result = "已为主机 host-a 签发新的 Agent 注册凭据; installer-disabled; \
+                      token: one-time-secret; panel: 127.0.0.1:50051";
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| super::draw_host_create_result(frame, result))
+            .expect("result render");
+        let rendered = rendered_text(&terminal);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("无法生成一键安装命令"), "{rendered}");
+        assert!(rendered.contains("[agent_install]"), "{rendered}");
+        assert_eq!(rendered.matches("one-time-secret").count(), 1, "{rendered}");
+    }
+
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         buffer
@@ -4233,6 +4359,7 @@ mod tests {
             .list_user_subscriptions(&users[0].id)
             .await
             .expect("subscriptions");
+        Uuid::parse_str(&subscriptions[0].xray_uuid).expect("generated Xray UUID");
         assert_eq!(subscriptions[0].traffic_multiplier_basis_points, 20_000);
         let binding = sqlx::query_as::<_, (String, String, i64, String)>(
             "SELECT billing_direction, reset_policy, initial_used_bytes, interface_name
@@ -4267,14 +4394,98 @@ mod tests {
     fn proxy_node_form_only_exposes_fields_for_the_selected_protocol() {
         let snapshot = TuiSnapshot::default();
         let mut form = ProxyNodeFormState::new(&snapshot);
-        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 5, 8, 9, 10]);
+        assert_eq!(
+            form.visible_items(),
+            &[
+                ProxyNodeFormItem::Tag,
+                ProxyNodeFormItem::Protocol,
+                ProxyNodeFormItem::Host,
+                ProxyNodeFormItem::Port,
+                ProxyNodeFormItem::ServerName,
+            ]
+        );
 
         form.cycle_profile(true);
-        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 7]);
+        assert_eq!(form.visible_items().len(), 4);
         form.cycle_profile(true);
-        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4, 6]);
+        assert_eq!(
+            form.visible_items().last(),
+            Some(&ProxyNodeFormItem::WebSocketPath)
+        );
         form.cycle_profile(true);
-        assert_eq!(form.visible_fields(), &[0, 1, 2, 3, 4]);
+        assert_eq!(form.visible_items().len(), 4);
+    }
+
+    #[test]
+    fn proxy_node_protocol_changes_only_while_its_row_is_focused() {
+        let snapshot = TuiSnapshot::default();
+        let mut form = ProxyNodeFormState::new(&snapshot);
+        form.handle_choice(&snapshot, true);
+        assert_eq!(form.profile, 0);
+
+        form.move_focus(true);
+        assert_eq!(form.active_item(), ProxyNodeFormItem::Protocol);
+        form.handle_choice(&snapshot, true);
+        assert_eq!(form.profile, 1);
+    }
+
+    #[test]
+    fn proxy_node_form_generates_hidden_reality_short_id() {
+        let form = ProxyNodeFormState::new(&TuiSnapshot::default());
+        let input = form.input();
+        assert_eq!(input.reality_short_id.len(), 8);
+        assert!(input
+            .reality_short_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(input.reality_fingerprint, "chrome");
+    }
+
+    #[test]
+    fn proxy_node_form_keeps_credential_and_publish_fields_out_of_view() {
+        let snapshot = TuiSnapshot {
+            nodes: vec![models::NodeOverview {
+                id: "host-a".into(),
+                name: "Tokyo".into(),
+                landing_host: "203.0.113.10".into(),
+                xray_listen_port: 443,
+                publish_host: None,
+                publish_port: None,
+                protocol: "vless".into(),
+                transport: "tcp".into(),
+                security: "none".into(),
+                server_name: None,
+                reality_public_key: None,
+                reality_short_id: None,
+                reality_fingerprint: None,
+                node_status: "pending".into(),
+                management_status: "active".into(),
+                desired_revision: 0,
+                agent_status: None,
+                last_seen_at: None,
+                agent_version: None,
+                xray_version: None,
+                cpu_usage_basis_points: None,
+                load_1_milli: None,
+                memory_total_bytes: None,
+                memory_used_bytes: None,
+                disk_total_bytes: None,
+                disk_used_bytes: None,
+            }],
+            ..TuiSnapshot::default()
+        };
+        let form = ProxyNodeFormState::new(&snapshot);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| super::draw_proxy_node_create(frame, &snapshot, &form))
+            .expect("form render");
+        let rendered = rendered_text(&terminal);
+        let compact = rendered.replace(' ', "");
+        assert!(compact.contains("协议(←/→切换)"), "{rendered}");
+        assert!(rendered.contains("vless-reality"), "{rendered}");
+        assert!(!compact.contains("订阅发布地址"), "{rendered}");
+        assert!(!compact.contains("Reality公钥"), "{rendered}");
+        assert!(!rendered.contains("short_id"), "{rendered}");
     }
 
     #[test]
@@ -4369,7 +4580,7 @@ mod tests {
         )
         .await
         .expect("regenerate install command");
-        assert!(regenerated.contains("generated Agent install command"));
+        assert!(regenerated.contains("已为主机"));
         assert!(regenerated.contains("--token '"));
         let token_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM registration_tokens")
             .fetch_one(database.pool())
