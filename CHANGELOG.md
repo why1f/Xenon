@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-alpha.15 - 2026-07-26
+
+### Fixed
+
+- Make the one-line Agent installer repair an existing same-host installation instead of ignoring fresh enrollment credentials when the binary version already matches.
+- Detect and replace the exact loopback test Agent identity during production enrollment while refusing to overwrite an Agent belonging to a different managed host.
+
 ## 0.1.0-alpha.14 - 2026-07-26
 
 ### Added

@@ -242,13 +242,25 @@ if [ "$UPGRADE" -eq 1 ]; then
   fail "upgrade failed and previous Agent could not be started"
 fi
 
+machine_id="$(cat /etc/machine-id 2>/dev/null || hostname)"
+agent_id="agent-$(printf '%s:%s' "$machine_id" "$NODE_ID" | sha256sum | cut -c1-24)"
 if [ -f /var/lib/xenon/agent/agent.toml ]; then
-  installed_sha256="$(sha256sum /usr/local/bin/xenon-agent | awk '{print $1}')"
-  [ "$installed_sha256" = "$(printf '%s' "$BINARY_SHA256" | tr 'A-F' 'a-f')" ] || \
-    fail "Agent is already installed with another binary; use --upgrade"
-  systemctl enable --now xenon-agent.service
-  printf 'Agent with version %s is already installed; nothing changed.\n' "$candidate_version"
-  exit 0
+  existing_agent_id="$(sed -n 's/^agent_id = "\([^"]*\)"$/\1/p' \
+    /var/lib/xenon/agent/agent.toml | head -n 1)"
+  existing_node_id="$(sed -n 's/^node_id = "\([^"]*\)"$/\1/p' \
+    /var/lib/xenon/agent/agent.toml | head -n 1)"
+  if [ "$existing_agent_id" = "xenon-local-test-agent" ] && \
+    [ "$existing_node_id" = "xenon-local-test-node" ]; then
+    printf 'Replacing the local test Agent configuration with production enrollment.\n'
+    systemctl stop xenon-agent.service >/dev/null 2>&1 || true
+    rm -rf /var/lib/xenon/agent/tls
+    rm -f /var/lib/xenon/agent/traffic-spool.json
+  elif [ "$existing_agent_id" != "$agent_id" ] || [ "$existing_node_id" != "$NODE_ID" ]; then
+    fail "this VPS belongs to another managed host ($existing_node_id); uninstall it before rebinding"
+  else
+    printf 'Repairing the existing Agent configuration for host %s.\n' "$NODE_ID"
+    systemctl stop xenon-agent.service >/dev/null 2>&1 || true
+  fi
 fi
 
 if [ -n "$CA_B64" ]; then
@@ -275,8 +287,6 @@ install -d -o xenon-agent -g xenon-agent -m 0700 /var/lib/xenon/agent/tls
 install -o xenon-agent -g xenon-agent -m 0600 \
   "$tmp_dir/panel-ca.crt" /var/lib/xenon/agent/tls/panel-ca.crt
 
-machine_id="$(cat /etc/machine-id 2>/dev/null || hostname)"
-agent_id="agent-$(printf '%s:%s' "$machine_id" "$NODE_ID" | sha256sum | cut -c1-24)"
 cat > /var/lib/xenon/agent/agent.toml <<EOF
 panel_endpoint = "$PANEL_ENDPOINT"
 agent_id = "$agent_id"
