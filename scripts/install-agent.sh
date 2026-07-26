@@ -10,7 +10,10 @@ NODE_ID=""
 TOKEN=""
 BINARY_URL=""
 BINARY_SHA256=""
+BINARY_SHA256_X86_64=""
+BINARY_SHA256_AARCH64=""
 CA_URL=""
+CA_B64=""
 AGENT_VERSION=""
 UNINSTALL=0
 UPGRADE=0
@@ -30,7 +33,10 @@ while [ "$#" -gt 0 ]; do
     --token) TOKEN="${2:-}"; shift 2 ;;
     --binary-url) BINARY_URL="${2:-}"; shift 2 ;;
     --binary-sha256) BINARY_SHA256="${2:-}"; shift 2 ;;
+    --binary-sha256-x86-64) BINARY_SHA256_X86_64="${2:-}"; shift 2 ;;
+    --binary-sha256-aarch64) BINARY_SHA256_AARCH64="${2:-}"; shift 2 ;;
     --ca-url) CA_URL="${2:-}"; shift 2 ;;
+    --ca-b64) CA_B64="${2:-}"; shift 2 ;;
     --agent-version) AGENT_VERSION="${2:-}"; shift 2 ;;
     --upgrade) UPGRADE=1; shift ;;
     --rollback) ROLLBACK=1; shift ;;
@@ -55,9 +61,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 case "$(uname -m)" in
-  x86_64|amd64|aarch64|arm64) ;;
+  x86_64|amd64) AGENT_ARCH="x86_64" ;;
+  aarch64|arm64) AGENT_ARCH="aarch64" ;;
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
+
+# Pick the architecture-specific pinned digest when one is provided.
+if [ "$AGENT_ARCH" = "x86_64" ] && [ -n "$BINARY_SHA256_X86_64" ]; then
+  BINARY_SHA256="$BINARY_SHA256_X86_64"
+elif [ "$AGENT_ARCH" = "aarch64" ] && [ -n "$BINARY_SHA256_AARCH64" ]; then
+  BINARY_SHA256="$BINARY_SHA256_AARCH64"
+fi
+BINARY_URL="$(printf '%s' "$BINARY_URL" | sed "s/{arch}/$AGENT_ARCH/g")"
 
 wait_for_service() {
   stable=0
@@ -98,7 +113,11 @@ fi
 if [ "$UPGRADE" -eq 0 ]; then
   case "$PANEL_ENDPOINT" in https://*) ;; *) fail "--panel must use https://" ;; esac
   case "$ENROLLMENT_ENDPOINT" in https://*) ;; *) fail "--enrollment must use https://" ;; esac
-  case "$CA_URL" in https://*) ;; *) fail "--ca-url must use https://" ;; esac
+  if [ -n "$CA_B64" ]; then
+    printf '%s' "$CA_B64" | grep -Eq '^[A-Za-z0-9+/=_-]+$' || fail "invalid --ca-b64"
+  else
+    case "$CA_URL" in https://*) ;; *) fail "--ca-url must use https:// (or pass --ca-b64)" ;; esac
+  fi
   printf '%s' "$PANEL_ENDPOINT" | grep -Eq '^https://[^[:space:]"\\]+$' || fail "invalid --panel"
   printf '%s' "$ENROLLMENT_ENDPOINT" | grep -Eq '^https://[^[:space:]"\\]+$' || fail "invalid --enrollment"
   printf '%s' "$NODE_ID" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' || fail "invalid --node"
@@ -175,7 +194,14 @@ if [ -f /var/lib/xenon/agent/agent.toml ]; then
   exit 0
 fi
 
-download "$CA_URL" "$tmp_dir/panel-ca.crt"
+if [ -n "$CA_B64" ]; then
+  printf '%s' "$CA_B64" | base64 -d > "$tmp_dir/panel-ca.crt" 2>/dev/null || \
+    fail "--ca-b64 is not valid base64"
+  grep -q "BEGIN CERTIFICATE" "$tmp_dir/panel-ca.crt" || \
+    fail "--ca-b64 does not decode to a PEM certificate"
+else
+  download "$CA_URL" "$tmp_dir/panel-ca.crt"
+fi
 
 install -d -o root -g root -m 0755 /var/lib/xenon
 if ! id xenon-agent >/dev/null 2>&1; then

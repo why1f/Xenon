@@ -165,9 +165,15 @@ pub struct AgentInstallConfig {
     #[serde(default)]
     pub binary_sha256: String,
     #[serde(default)]
+    pub binary_sha256_x86_64: String,
+    #[serde(default)]
+    pub binary_sha256_aarch64: String,
+    #[serde(default)]
     pub binary_version: String,
     #[serde(default)]
     pub ca_url: String,
+    #[serde(default)]
+    pub ca_path: String,
     #[serde(default)]
     pub panel_endpoint: String,
     #[serde(default)]

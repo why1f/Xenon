@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table, Tabs, Wrap},
     Terminal,
 };
 use std::{io, sync::Arc, time::Duration};
@@ -852,24 +852,80 @@ async fn create_node(
         .await
         .context("store node and registration token")?;
     if agent_install.enabled {
+        let binary_args = agent_binary_args(agent_install)?;
+        let ca_arg = agent_ca_arg(agent_install)?;
         Ok(format!(
-            "created node {node_id}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo sh -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' --binary-url '{}' --binary-sha256 '{}' --agent-version '{}' --ca-url '{}'",
+            "created node {node_id}; install: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --panel '{}' --enrollment '{}' --server-name '{}' --node '{}' --token '{}' {binary_args} {ca_arg}",
             agent_install.script_url,
             agent_install.panel_endpoint,
             agent_install.enrollment_endpoint,
             agent_install.server_name,
             node_id,
             token,
-            agent_install.binary_url,
-            agent_install.binary_sha256,
-            agent_install.binary_version,
-            agent_install.ca_url,
         ))
     } else {
         Ok(format!(
             "created node {node_id}; registration token: {token}; Panel {grpc_addr}; agent installer is not configured"
         ))
     }
+}
+
+fn agent_binary_args(agent_install: &AgentInstallConfig) -> anyhow::Result<String> {
+    if agent_install.binary_url.is_empty() {
+        anyhow::bail!("agent_install.binary_url is not configured");
+    }
+    let mut args = format!("--binary-url '{}'", agent_install.binary_url);
+    let mut pinned = false;
+    if !agent_install.binary_sha256_x86_64.is_empty() {
+        args.push_str(&format!(
+            " --binary-sha256-x86-64 '{}'",
+            agent_install.binary_sha256_x86_64
+        ));
+        pinned = true;
+    }
+    if !agent_install.binary_sha256_aarch64.is_empty() {
+        args.push_str(&format!(
+            " --binary-sha256-aarch64 '{}'",
+            agent_install.binary_sha256_aarch64
+        ));
+        pinned = true;
+    }
+    if !agent_install.binary_sha256.is_empty() {
+        args.push_str(&format!(
+            " --binary-sha256 '{}'",
+            agent_install.binary_sha256
+        ));
+        pinned = true;
+    }
+    if !pinned {
+        anyhow::bail!("agent_install has no pinned binary SHA-256");
+    }
+    if !agent_install.binary_version.is_empty() {
+        args.push_str(&format!(
+            " --agent-version '{}'",
+            agent_install.binary_version
+        ));
+    }
+    Ok(args)
+}
+
+fn agent_ca_arg(agent_install: &AgentInstallConfig) -> anyhow::Result<String> {
+    if !agent_install.ca_path.is_empty() {
+        let pem = std::fs::read(&agent_install.ca_path)
+            .with_context(|| format!("read agent CA at {}", agent_install.ca_path))?;
+        if !pem.starts_with(b"-----BEGIN CERTIFICATE") {
+            anyhow::bail!("agent_install.ca_path is not a PEM certificate");
+        }
+        use base64::Engine as _;
+        return Ok(format!(
+            "--ca-b64 '{}'",
+            base64::engine::general_purpose::STANDARD.encode(pem)
+        ));
+    }
+    if !agent_install.ca_url.is_empty() {
+        return Ok(format!("--ca-url '{}'", agent_install.ca_url));
+    }
+    anyhow::bail!("agent_install needs ca_path or ca_url")
 }
 
 fn agent_upgrade_command(
@@ -879,19 +935,17 @@ fn agent_upgrade_command(
     if !agent_install.enabled {
         anyhow::bail!("Agent release source is not configured");
     }
+    let binary_args = agent_binary_args(agent_install)?;
     Ok(format!(
-        "node {node_id}; upgrade: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo sh -s -- --upgrade --binary-url '{}' --binary-sha256 '{}' --agent-version '{}'; rollback: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo sh -s -- --rollback",
-        agent_install.script_url,
-        agent_install.binary_url,
-        agent_install.binary_sha256,
-        agent_install.binary_version,
-        agent_install.script_url,
+        "node {node_id}; upgrade: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --upgrade {binary_args}; rollback: curl -fsSL --proto '=https' --tlsv1.2 '{}' | sudo bash -s -- --rollback",
+        agent_install.script_url, agent_install.script_url,
     ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Dashboard,
+    Users,
     Create,
     NodeCreate,
     Revoke,
@@ -1165,34 +1219,76 @@ fn run_blocking(
         terminal.draw(|frame| match page {
             Page::Dashboard => {
                 let area = draw_primary_shell(frame, &snapshot, 0);
-                draw_dashboard(frame, area, &snapshot, selected_user);
+                draw_dashboard(frame, area, &snapshot);
             }
-            Page::Create => draw_create(frame, &snapshot, &form),
-            Page::NodeCreate => draw_node_create(frame, &node_form),
-            Page::Revoke => draw_revoke(frame, &snapshot, &revoke_node_id),
+            Page::Users => {
+                let area = draw_primary_shell(frame, &snapshot, 1);
+                draw_users(frame, area, &snapshot, selected_user);
+            }
+            Page::Create => {
+                let area = draw_primary_shell(frame, &snapshot, 1);
+                draw_users(frame, area, &snapshot, selected_user);
+                draw_create(frame, &snapshot, &form);
+            }
+            Page::NodeCreate => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_nodes(frame, area, &snapshot, selected_node);
+                draw_node_create(frame, &node_form);
+            }
+            Page::Revoke => {
+                let area = draw_primary_shell(
+                    frame,
+                    &snapshot,
+                    if revoke_returns_to_nodes { 2 } else { 0 },
+                );
+                if revoke_returns_to_nodes {
+                    draw_nodes(frame, area, &snapshot, selected_node);
+                } else {
+                    draw_dashboard(frame, area, &snapshot);
+                }
+                draw_revoke(frame, &snapshot, &revoke_node_id);
+            }
             Page::UserDetail => draw_user_detail(frame, &snapshot, selected_subscription),
             Page::NicBindings => {
                 draw_nic_bindings(frame, &snapshot, selected_subscription, selected_binding)
             }
-            Page::NicCreate => draw_nic_create(frame, &snapshot, &nic_form),
-            Page::NicUnbindConfirm => draw_nic_unbind_confirm(frame, &snapshot, &unbind_binding_id),
+            Page::NicCreate => {
+                draw_nic_bindings(frame, &snapshot, selected_subscription, selected_binding);
+                draw_nic_create(frame, &snapshot, &nic_form);
+            }
+            Page::NicUnbindConfirm => {
+                draw_nic_bindings(frame, &snapshot, selected_subscription, selected_binding);
+                draw_nic_unbind_confirm(frame, &snapshot, &unbind_binding_id);
+            }
             Page::SubscriptionEdit => {
+                draw_user_detail(frame, &snapshot, selected_subscription);
                 if let Some(form) = subscription_form.as_ref() {
                     draw_subscription_edit(frame, form);
                 }
             }
-            Page::SubscriptionRotateConfirm => draw_subscription_rotate_confirm(
-                frame,
-                &snapshot,
-                selected_subscription,
-                rotate_kind,
-            ),
+            Page::SubscriptionRotateConfirm => {
+                draw_user_detail(frame, &snapshot, selected_subscription);
+                draw_subscription_rotate_confirm(
+                    frame,
+                    &snapshot,
+                    selected_subscription,
+                    rotate_kind,
+                );
+            }
             Page::Nodes => {
-                let area = draw_primary_shell(frame, &snapshot, 1);
+                let area = draw_primary_shell(frame, &snapshot, 2);
                 draw_nodes(frame, area, &snapshot, selected_node);
             }
-            Page::NodeEdit => draw_node_edit(frame, &node_form, &edit_node_id),
-            Page::NodeDeleteConfirm => draw_node_delete_confirm(frame, &snapshot, &delete_node_id),
+            Page::NodeEdit => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_nodes(frame, area, &snapshot, selected_node);
+                draw_node_edit(frame, &node_form, &edit_node_id);
+            }
+            Page::NodeDeleteConfirm => {
+                let area = draw_primary_shell(frame, &snapshot, 2);
+                draw_nodes(frame, area, &snapshot, selected_node);
+                draw_node_delete_confirm(frame, &snapshot, &delete_node_id);
+            }
         })?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -1203,6 +1299,9 @@ fn run_blocking(
                     Page::Dashboard => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Tab | KeyCode::Char('2') => {
+                            page = Page::Users;
+                        }
+                        KeyCode::Char('3') | KeyCode::Char('N') => {
                             selected_node = 0;
                             page = Page::Nodes;
                         }
@@ -1214,10 +1313,6 @@ fn run_blocking(
                             node_form = NodeFormState::default();
                             page = Page::NodeCreate;
                         }
-                        KeyCode::Char('N') => {
-                            selected_node = 0;
-                            page = Page::Nodes;
-                        }
                         KeyCode::Char('r') => {
                             revoke_returns_to_nodes = false;
                             revoke_node_id = snapshot
@@ -1226,6 +1321,19 @@ fn run_blocking(
                                 .map(|node| node.id.clone())
                                 .unwrap_or_default();
                             page = Page::Revoke;
+                        }
+                        _ => {}
+                    },
+                    Page::Users => match key.code {
+                        KeyCode::Char('q') => break Ok(()),
+                        KeyCode::Esc | KeyCode::Char('1') => page = Page::Dashboard,
+                        KeyCode::Tab | KeyCode::Char('3') => {
+                            selected_node = 0;
+                            page = Page::Nodes;
+                        }
+                        KeyCode::Char('c') => {
+                            form = FormState::from_snapshot(&snapshot);
+                            page = Page::Create;
                         }
                         KeyCode::Up => {
                             selected_user = selected_user.saturating_sub(1);
@@ -1249,7 +1357,7 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::Create => match key.code {
-                        KeyCode::Esc => page = Page::Dashboard,
+                        KeyCode::Esc => page = Page::Users,
                         KeyCode::Tab | KeyCode::Down => form.active = (form.active + 1) % 8,
                         KeyCode::BackTab | KeyCode::Up => form.active = (form.active + 7) % 8,
                         KeyCode::Enter => {
@@ -1259,7 +1367,7 @@ fn run_blocking(
                             {
                                 break Ok(());
                             }
-                            page = Page::Dashboard;
+                            page = Page::Users;
                         }
                         KeyCode::Backspace => {
                             form.fields[form.active].pop();
@@ -1268,7 +1376,7 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::NodeCreate => match key.code {
-                        KeyCode::Esc => page = Page::Dashboard,
+                        KeyCode::Esc => page = Page::Nodes,
                         KeyCode::Tab | KeyCode::Down => {
                             node_form.active = (node_form.active + 1) % 10
                         }
@@ -1282,7 +1390,7 @@ fn run_blocking(
                             {
                                 break Ok(());
                             }
-                            page = Page::Dashboard;
+                            page = Page::Nodes;
                         }
                         KeyCode::Backspace => {
                             node_form.fields[node_form.active].pop();
@@ -1318,7 +1426,7 @@ fn run_blocking(
                         _ => {}
                     },
                     Page::UserDetail => match key.code {
-                        KeyCode::Esc | KeyCode::Left => page = Page::Dashboard,
+                        KeyCode::Esc | KeyCode::Left => page = Page::Users,
                         KeyCode::Char('b') | KeyCode::Enter => {
                             selected_binding = 0;
                             page = Page::NicBindings;
@@ -1569,6 +1677,7 @@ fn run_blocking(
                         KeyCode::Esc | KeyCode::Left | KeyCode::Tab | KeyCode::Char('1') => {
                             page = Page::Dashboard
                         }
+                        KeyCode::Char('2') => page = Page::Users,
                         KeyCode::Up => selected_node = selected_node.saturating_sub(1),
                         KeyCode::Down if !snapshot.nodes.is_empty() => {
                             selected_node = (selected_node + 1).min(snapshot.nodes.len() - 1);
@@ -1693,7 +1802,7 @@ fn draw_primary_shell(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(18), Constraint::Length(34)])
         .split(areas[0]);
-    let tabs = Tabs::new(vec!["总览 [1]", "节点 [2]"])
+    let tabs = Tabs::new(vec!["仪表盘 [1]", "用户 [2]", "节点 [3]"])
         .select(selected_tab)
         .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
         .style(Style::default().fg(Color::DarkGray))
@@ -1726,10 +1835,10 @@ fn draw_primary_shell(
     );
 
     let (footer, footer_style) = if snapshot.notice.is_empty() {
-        let keys = if selected_tab == 0 {
-            "[Tab] 切换  [↑↓] 用户  [Enter] 详情  [c] 新建订阅  [n] 新建节点  [q] 退出"
-        } else {
-            "[Tab] 切换  [↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建"
+        let keys = match selected_tab {
+            0 => "[Tab/2] 用户  [3] 节点  [c] 新建订阅  [n] 新建节点  [q] 退出",
+            1 => "[↑↓] 选择  [Enter] 详情  [c] 新建订阅  [1] 仪表盘  [3] 节点  [q] 退出",
+            _ => "[↑↓] 选择  [Enter/e] 编辑  [d] 启停  [u] 升级  [n] 新建  [1] 仪表盘  [2] 用户",
         };
         (keys, Style::default().fg(Color::DarkGray))
     } else {
@@ -1742,12 +1851,7 @@ fn draw_primary_shell(
     areas[1]
 }
 
-fn draw_dashboard(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    snapshot: &TuiSnapshot,
-    selected_user: usize,
-) {
+fn draw_dashboard(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &TuiSnapshot) {
     if area.width < 48 || area.height < 12 {
         let text = format!(
             "Panel: active  Agents: {}  Users: {}  Nodes: {}",
@@ -1870,65 +1974,8 @@ fn draw_dashboard(
     }
 
     if stats_height > 0 {
-        let enabled = snapshot
-            .users
-            .iter()
-            .filter(|user| user.status == "active")
-            .count();
-        let over_quota = snapshot
-            .users
-            .iter()
-            .filter(|user| {
-                user.traffic_limit_bytes
-                    .is_some_and(|limit| limit > 0 && user.charged_bytes >= limit)
-            })
-            .count();
-        let expired = snapshot
-            .users
-            .iter()
-            .filter(|user| user.expired_subscriptions > 0)
-            .count();
-        let total_charged = snapshot
-            .users
-            .iter()
-            .map(|user| user.charged_bytes)
-            .fold(0_i64, i64::saturating_add);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw("用户 "),
-                Span::styled(
-                    snapshot.users.len().to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  启用:"),
-                Span::styled(enabled.to_string(), Style::default().fg(Color::Green)),
-                Span::raw("  超额:"),
-                Span::styled(
-                    over_quota.to_string(),
-                    Style::default().fg(if over_quota > 0 {
-                        Color::Red
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::raw("  到期:"),
-                Span::styled(
-                    expired.to_string(),
-                    Style::default().fg(if expired > 0 {
-                        Color::Yellow
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::raw("    本周期计费 "),
-                Span::styled(
-                    format_bytes(total_charged),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]))
-            .block(panel_block("用户摘要")),
+            Paragraph::new(user_stats_line(snapshot)).block(panel_block("用户摘要")),
             areas[3],
         );
     }
@@ -1939,7 +1986,7 @@ fn draw_dashboard(
         .map(|user| user.charged_bytes)
         .max()
         .unwrap_or_default();
-    let user_rows = snapshot.users.iter().enumerate().map(|(index, user)| {
+    let user_rows = snapshot.users.iter().take(5).map(|user| {
         Row::new(vec![
             Cell::from(user.username.clone()),
             Cell::from(user.status.clone()).style(Style::default().fg(status_color(&user.status))),
@@ -1948,9 +1995,8 @@ fn draw_dashboard(
             Cell::from(quota_label(user)),
             Cell::from(usage_bar(user.charged_bytes, max_usage, 18)),
         ])
-        .style(selected_style(index == selected_user))
     });
-    let users_title = format!("用户流量排行 · {}", snapshot.users.len());
+    let users_title = format!("用量 Top 5 · 共 {} 用户", snapshot.users.len());
     let users = Table::new(
         user_rows,
         [
@@ -2021,6 +2067,143 @@ fn quota_label(user: &models::UserSummary) -> String {
         }
         _ => "∞".to_string(),
     }
+}
+
+struct UserStats {
+    enabled: usize,
+    over_quota: usize,
+    expired: usize,
+    total_charged: i64,
+}
+
+fn user_stats(snapshot: &TuiSnapshot) -> UserStats {
+    UserStats {
+        enabled: snapshot
+            .users
+            .iter()
+            .filter(|user| user.status == "active")
+            .count(),
+        over_quota: snapshot
+            .users
+            .iter()
+            .filter(|user| {
+                user.traffic_limit_bytes
+                    .is_some_and(|limit| limit > 0 && user.charged_bytes >= limit)
+            })
+            .count(),
+        expired: snapshot
+            .users
+            .iter()
+            .filter(|user| user.expired_subscriptions > 0)
+            .count(),
+        total_charged: snapshot
+            .users
+            .iter()
+            .map(|user| user.charged_bytes)
+            .fold(0_i64, i64::saturating_add),
+    }
+}
+
+fn user_stats_line(snapshot: &TuiSnapshot) -> Line<'static> {
+    let stats = user_stats(snapshot);
+    Line::from(vec![
+        Span::raw("用户 "),
+        Span::styled(
+            snapshot.users.len().to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  启用:"),
+        Span::styled(stats.enabled.to_string(), Style::default().fg(Color::Green)),
+        Span::raw("  超额:"),
+        Span::styled(
+            stats.over_quota.to_string(),
+            Style::default().fg(if stats.over_quota > 0 {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw("  到期:"),
+        Span::styled(
+            stats.expired.to_string(),
+            Style::default().fg(if stats.expired > 0 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw("    本周期计费 "),
+        Span::styled(
+            format_bytes(stats.total_charged),
+            Style::default().fg(Color::Cyan),
+        ),
+    ])
+}
+
+fn draw_users(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &TuiSnapshot,
+    selected_user: usize,
+) {
+    if area.width < 48 || area.height < 8 {
+        frame.render_widget(
+            Paragraph::new(format!("用户总数: {}", snapshot.users.len()))
+                .block(panel_block("用户管理")),
+            area,
+        );
+        return;
+    }
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(user_stats_line(snapshot)).block(panel_block("用户摘要")),
+        areas[0],
+    );
+    let max_usage = snapshot
+        .users
+        .iter()
+        .map(|user| user.charged_bytes)
+        .max()
+        .unwrap_or_default();
+    let rows = snapshot.users.iter().enumerate().map(|(index, user)| {
+        Row::new(vec![
+            Cell::from(user.username.clone()),
+            Cell::from(user.status.clone()).style(Style::default().fg(status_color(&user.status))),
+            Cell::from(user.subscription_count.to_string()),
+            Cell::from(format_bytes(user.charged_bytes)),
+            Cell::from(quota_label(user)),
+            Cell::from(usage_bar(user.charged_bytes, max_usage, 18)),
+        ])
+        .style(selected_style(index == selected_user))
+    });
+    let title = format!("用户列表 · {}", snapshot.users.len());
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(22),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(13),
+            Constraint::Length(16),
+            Constraint::Min(12),
+        ],
+    )
+    .header(table_header([
+        "用户",
+        "状态",
+        "订阅",
+        "Xray 计费",
+        "额度",
+        "相对用量",
+    ]))
+    .column_spacing(1)
+    .block(panel_block(&title));
+    frame.render_widget(table, areas[1]);
 }
 
 fn draw_nodes(
@@ -2311,52 +2494,51 @@ fn draw_node_edit(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, node_id:
     draw_node_form(
         frame,
         form,
-        &format!("Edit node {}", truncate(node_id, 16)),
-        "Save",
+        &format!("编辑节点 {}", truncate(node_id, 16)),
+        "保存",
     );
 }
 
 fn draw_node_delete_confirm(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: &str) {
-    let text = format!(
-        "Logically delete node {node_id}?\n\nActive subscription and NIC references must be removed first.\nAgent certificates will be revoked.\n\n{}\n\nEnter Confirm   Esc Cancel",
-        snapshot.notice
-    );
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::ALL).title("Delete node")),
-        frame.area(),
-    );
+    let body = vec![
+        Line::from(format!("逻辑删除节点 {node_id}？")),
+        Line::default(),
+        Line::from("需先移除活跃订阅和网卡绑定引用。"),
+        Line::from("该节点的 Agent 证书将被吊销。"),
+        Line::default(),
+        Line::from(Span::styled(
+            snapshot.notice.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let inner = modal_area(frame, 64, 10, "删除节点", true);
+    modal_body_and_hint(frame, inner, body, "[Enter] 确认  [Esc] 取消");
 }
 
 fn draw_revoke(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, node_id: &str) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new("Emergency Agent certificate revocation")
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("Revoke")),
-        areas[0],
-    );
-    let mut body = format!("Node ID: {node_id}\n\nRegistered nodes:\n");
-    for node in snapshot.nodes.iter().take(12) {
-        body.push_str(&format!("  {} ({})\n", node.id, node.name));
+    let mut body = vec![
+        Line::from(vec![
+            Span::raw("节点 ID: "),
+            Span::styled(
+                node_id.to_string(),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "已注册节点:",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    for node in snapshot.nodes.iter().take(8) {
+        body.push(Line::from(format!("  {} ({})", node.id, node.name)));
     }
-    frame.render_widget(
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Target")),
-        areas[1],
-    );
-    frame.render_widget(
-        Paragraph::new("Enter Revoke all Agent certificates   Esc Cancel")
-            .style(Style::default().fg(Color::Red))
-            .block(Block::default().borders(Borders::ALL).title("Confirm")),
-        areas[2],
+    let inner = modal_area(frame, 72, 16, "紧急吊销 Agent 证书", true);
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        "[Enter] 吊销该节点全部 Agent 证书  [Esc] 取消",
     );
 }
 
@@ -2551,46 +2733,32 @@ fn draw_nic_create(
     snapshot: &TuiSnapshot,
     form: &NicBindingFormState,
 ) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new("Add NIC binding")
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("NIC billing")),
-        areas[0],
-    );
     let labels = [
-        "Node ID",
-        "Interface",
-        "Traffic limit bytes",
-        "Initial used bytes",
-        "Direction (rx_tx, tx_only, rx_only)",
-        "Reset policy",
+        "节点 ID",
+        "网卡名",
+        "流量额度字节",
+        "初始已用字节",
+        "计费方向 (rx_tx/tx_only/rx_only)",
+        "重置策略",
     ];
     let mut body = form_lines(&labels, &form.fields, form.active);
     body.push(Line::default());
     body.push(Line::from(Span::styled(
-        "Reported interfaces:",
+        "已上报网卡:",
         Style::default().fg(Color::Yellow),
     )));
-    for interface in snapshot.interfaces.iter().take(10) {
+    for interface in snapshot.interfaces.iter().take(6) {
         body.push(Line::from(format!(
             "  {}/{}",
             interface.node_id, interface.interface_name
         )));
     }
-    frame.render_widget(Paragraph::new(body).block(panel_block("Fields")), areas[1]);
-    frame.render_widget(
-        Paragraph::new("Tab/Up/Down Move   Enter Add   Esc Cancel")
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
-        areas[2],
+    let inner = modal_area(frame, 72, 18, "添加网卡绑定", false);
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        "[Tab/↑↓] 切换  [Enter] 添加  [Esc] 取消",
     );
 }
 
@@ -2599,57 +2767,43 @@ fn draw_nic_unbind_confirm(
     snapshot: &TuiSnapshot,
     binding_id: &str,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Confirm unbind");
-    let text = format!(
-        "Disable NIC binding {binding_id}?\n\nHistorical records remain stored.\n\n{}\n\nEnter Confirm   Esc Cancel",
-        snapshot.notice
-    );
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::Red))
-            .block(block),
-        frame.area(),
-    );
+    let body = vec![
+        Line::from(format!("解绑网卡绑定 {binding_id}？")),
+        Line::default(),
+        Line::from("历史记录仍会保留。"),
+        Line::default(),
+        Line::from(Span::styled(
+            snapshot.notice.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let inner = modal_area(frame, 64, 9, "确认解绑", true);
+    modal_body_and_hint(frame, inner, body, "[Enter] 确认  [Esc] 取消");
 }
 
 fn draw_subscription_edit(frame: &mut ratatui::Frame<'_>, form: &SubscriptionEditFormState) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Edit subscription {}",
-            truncate(&form.subscription_id, 16)
-        ))
-        .style(Style::default().add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::ALL).title("Subscription")),
-        areas[0],
-    );
     let labels = [
-        "Name",
-        "Node IDs (comma separated)",
-        "Xray limit bytes (empty = unlimited)",
-        "Expiry Unix time (empty = never)",
-        "Multiplier (1 or 2)",
-        "Reset (never, manual, daily:HH:MM, monthly:DAY@HH:MM, interval:DAYS)",
-        "Status (active or disabled)",
+        "订阅名称",
+        "节点 ID (逗号分隔)",
+        "Xray 流量额度字节 (留空不限)",
+        "到期 Unix 时间 (留空永久)",
+        "计费倍率 (1 或 2)",
+        "重置 (never/manual/daily:HH:MM/monthly:DAY@HH:MM/interval:DAYS)",
+        "状态 (active 或 disabled)",
     ];
-    frame.render_widget(
-        Paragraph::new(form_lines(&labels, &form.fields, form.active)).block(panel_block("Fields")),
-        areas[1],
+    let body = form_lines(&labels, &form.fields, form.active);
+    let inner = modal_area(
+        frame,
+        76,
+        12,
+        &format!("编辑订阅 {}", truncate(&form.subscription_id, 16)),
+        false,
     );
-    frame.render_widget(
-        Paragraph::new("Tab/Up/Down Move   Enter Save   Esc Cancel")
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
-        areas[2],
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        "[Tab/↑↓] 切换  [Enter] 保存  [Esc] 取消",
     );
 }
 
@@ -2664,135 +2818,144 @@ fn draw_subscription_rotate_confirm(
         .as_ref()
         .and_then(|detail| detail.subscriptions.get(selected_subscription));
     let (label, impact) = match kind {
-        RotateKind::Token => (
-            "subscription token",
-            "The old subscription URL stops working immediately.",
-        ),
-        RotateKind::Uuid => (
-            "Xray UUID",
-            "Agents will replace this user and clients must refresh the subscription.",
-        ),
+        RotateKind::Token => ("订阅 Token", "旧订阅链接将立即失效。"),
+        RotateKind::Uuid => ("Xray UUID", "Agent 将替换该用户，客户端需刷新订阅。"),
     };
-    let text = format!(
-        "Rotate {label} for {}?\n\n{impact}\nThe new secret is displayed only once.\n\nEnter Confirm   Esc Cancel",
-        subscription.map_or("-", |record| record.name.as_str())
-    );
-    frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::Red))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Confirm rotation"),
-            ),
-        frame.area(),
-    );
+    let body = vec![
+        Line::from(format!(
+            "确认为 {} 轮换{label}？",
+            subscription.map_or("-", |record| record.name.as_str())
+        )),
+        Line::default(),
+        Line::from(impact),
+        Line::from("新密钥只显示一次。"),
+    ];
+    let inner = modal_area(frame, 64, 9, "确认轮换", true);
+    modal_body_and_hint(frame, inner, body, "[Enter] 确认  [Esc] 取消");
 }
 
 fn draw_create(frame: &mut ratatui::Frame<'_>, snapshot: &TuiSnapshot, form: &FormState) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new("Create user + subscription")
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("Wizard")),
-        areas[0],
-    );
     let labels = [
-        "Username",
-        "Subscription name",
-        "Node IDs (comma separated)",
-        "Xray limit bytes (empty = unlimited)",
-        "Expiry Unix time (empty = never)",
-        "Multiplier (1 or 2)",
-        "Reset (never, manual, daily:HH:MM, monthly:DAY@HH:MM, interval:DAYS)",
-        "NIC node/interface/limit/initial[/direction[/reset]] (; separated)",
+        "用户名 *必填",
+        "订阅名称 *必填",
+        "节点 ID (逗号分隔)",
+        "Xray 流量额度字节 (留空不限)",
+        "到期 Unix 时间 (留空永久)",
+        "计费倍率 (1 或 2)",
+        "重置 (never/manual/daily:HH:MM/monthly:DAY@HH:MM/interval:DAYS)",
+        "网卡 节点/网卡/额度/初始[/方向[/重置]] (; 分隔)",
     ];
     let mut body = form_lines(&labels, &form.fields, form.active);
     body.push(Line::default());
     body.push(Line::from(Span::styled(
-        "Available nodes:",
+        "可用节点:",
         Style::default().fg(Color::Yellow),
     )));
     for node in snapshot
         .nodes
         .iter()
         .filter(|node| node.management_status == "active")
-        .take(8)
+        .take(5)
     {
         body.push(Line::from(format!("  {} ({})", node.id, node.name)));
     }
-    body.push(Line::default());
     body.push(Line::from(Span::styled(
-        "Reported interfaces:",
+        "已上报网卡:",
         Style::default().fg(Color::Yellow),
     )));
-    for interface in snapshot.interfaces.iter().take(8) {
+    for interface in snapshot.interfaces.iter().take(5) {
         body.push(Line::from(format!(
             "  {}/{}",
             interface.node_id, interface.interface_name
         )));
     }
-    frame.render_widget(Paragraph::new(body).block(panel_block("Fields")), areas[1]);
-    frame.render_widget(
-        Paragraph::new("Tab/Up/Down Move   Enter Create   Esc Cancel")
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
-        areas[2],
+    let inner = modal_area(frame, 78, 24, "新建用户与订阅", false);
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        "[Tab/↑↓] 切换  [Enter] 创建  [Esc] 取消",
     );
 }
 
 fn draw_node_create(frame: &mut ratatui::Frame<'_>, form: &NodeFormState) {
-    draw_node_form(
-        frame,
-        form,
-        "Create node + one-time registration token",
-        "Create",
-    );
+    draw_node_form(frame, form, "添加节点", "创建");
 }
 
 fn draw_node_form(frame: &mut ratatui::Frame<'_>, form: &NodeFormState, title: &str, action: &str) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new(title)
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL).title("Node Wizard")),
-        areas[0],
-    );
     let labels = [
-        "Node name",
-        "Landing host or IP",
-        "Xray listen port",
-        "Optional relay host",
-        "Optional relay port",
-        "Security (none, tls, reality)",
+        "节点名称 *必填",
+        "落地机地址/IP *必填",
+        "Xray 监听端口",
+        "中转发布地址 (可选)",
+        "中转发布端口 (可选)",
+        "安全类型 (none/tls/reality)",
         "TLS/Reality server name",
-        "Reality public key",
+        "Reality 公钥",
         "Reality short ID",
-        "Reality fingerprint",
+        "Reality 指纹",
     ];
-    frame.render_widget(
-        Paragraph::new(form_lines(&labels, &form.fields, form.active)).block(panel_block("Fields")),
-        areas[1],
+    let mut body = form_lines(&labels, &form.fields, form.active);
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        "Reality 私钥保存在被控端 agent.toml，主控只保存客户端参数",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let inner = modal_area(frame, 72, 16, title, false);
+    modal_body_and_hint(
+        frame,
+        inner,
+        body,
+        &format!("[Tab/↑↓] 切换  [Enter] {action}  [Esc] 取消"),
     );
+}
+
+fn modal_area(
+    frame: &mut ratatui::Frame<'_>,
+    width: u16,
+    height: u16,
+    title: &str,
+    danger: bool,
+) -> Rect {
+    let screen = frame.area();
+    let width = width.min(screen.width.saturating_sub(2)).max(1);
+    let height = height.min(screen.height.saturating_sub(2)).max(1);
+    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let border = if danger { Color::Red } else { Color::Green };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+fn modal_body_and_hint(
+    frame: &mut ratatui::Frame<'_>,
+    inner: Rect,
+    body: Vec<Line<'static>>,
+    hint: &str,
+) {
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
     frame.render_widget(
-        Paragraph::new(format!("Tab/Up/Down Move   Enter {action}   Esc Cancel"))
-            .style(Style::default().fg(Color::Green))
-            .block(Block::default().borders(Borders::ALL).title("Keys")),
-        areas[2],
+        Paragraph::new(hint.to_string()).style(Style::default().fg(Color::DarkGray)),
+        rows[1],
     );
 }
 
@@ -2929,8 +3092,10 @@ mod tests {
         terminal
             .draw(|frame| {
                 let dashboard = super::draw_primary_shell(frame, &snapshot, 0);
-                super::draw_dashboard(frame, dashboard, &snapshot, 0);
-                let nodes = super::draw_primary_shell(frame, &snapshot, 1);
+                super::draw_dashboard(frame, dashboard, &snapshot);
+                let users = super::draw_primary_shell(frame, &snapshot, 1);
+                super::draw_users(frame, users, &snapshot, 0);
+                let nodes = super::draw_primary_shell(frame, &snapshot, 2);
                 super::draw_nodes(frame, nodes, &snapshot, 0);
                 super::draw_node_edit(frame, &node_form, "node");
                 super::draw_node_delete_confirm(frame, &snapshot, "node");
@@ -3002,17 +3167,30 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = super::draw_primary_shell(frame, &snapshot, 0);
-                super::draw_dashboard(frame, area, &snapshot, 0);
+                super::draw_dashboard(frame, area, &snapshot);
             })
             .expect("dashboard render");
         let dashboard = rendered_text(&terminal);
         let compact_dashboard = dashboard.replace(' ', "");
-        assert!(compact_dashboard.contains("总览[1]"), "{dashboard}");
+        assert!(compact_dashboard.contains("仪表盘[1]"), "{dashboard}");
         assert!(compact_dashboard.contains("平均CPU"), "{dashboard}");
-        assert!(compact_dashboard.contains("用户流量排行"), "{dashboard}");
+        assert!(compact_dashboard.contains("用量Top5"), "{dashboard}");
+        assert!(compact_dashboard.contains("用户摘要"), "{dashboard}");
         assert!(dashboard.contains("admin"), "{dashboard}");
         assert!(dashboard.contains("relay.example:8443"), "{dashboard}");
-        assert!(terminal
+
+        let mut users_terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
+        users_terminal
+            .draw(|frame| {
+                let area = super::draw_primary_shell(frame, &snapshot, 1);
+                super::draw_users(frame, area, &snapshot, 0);
+            })
+            .expect("users render");
+        let users = rendered_text(&users_terminal);
+        let compact_users = users.replace(' ', "");
+        assert!(compact_users.contains("用户列表"), "{users}");
+        assert!(users.contains("admin"), "{users}");
+        assert!(users_terminal
             .backend()
             .buffer()
             .content
@@ -3022,13 +3200,13 @@ mod tests {
         let mut node_terminal = Terminal::new(TestBackend::new(120, 36)).expect("test terminal");
         node_terminal
             .draw(|frame| {
-                let area = super::draw_primary_shell(frame, &snapshot, 1);
+                let area = super::draw_primary_shell(frame, &snapshot, 2);
                 super::draw_nodes(frame, area, &snapshot, 0);
             })
             .expect("nodes render");
         let nodes = rendered_text(&node_terminal);
         let compact_nodes = nodes.replace(' ', "");
-        assert!(compact_nodes.contains("节点[2]"), "{nodes}");
+        assert!(compact_nodes.contains("节点[3]"), "{nodes}");
         assert!(compact_nodes.contains("节点清单"), "{nodes}");
         assert!(compact_nodes.contains("选中节点"), "{nodes}");
         assert!(nodes.contains("26.6.27"), "{nodes}");
@@ -3123,10 +3301,13 @@ mod tests {
         let install = crate::config::AgentInstallConfig {
             enabled: true,
             script_url: "https://downloads.test/install-agent.sh".into(),
-            binary_url: "https://downloads.test/xenon-agent".into(),
-            binary_sha256: "a".repeat(64),
+            binary_url: "https://downloads.test/xenon-agent-linux-{arch}".into(),
+            binary_sha256: String::new(),
+            binary_sha256_x86_64: "a".repeat(64),
+            binary_sha256_aarch64: "b".repeat(64),
             binary_version: "0.1.0".into(),
             ca_url: "https://downloads.test/panel-ca.crt".into(),
+            ca_path: String::new(),
             panel_endpoint: "https://panel.test:50051".into(),
             enrollment_endpoint: "https://panel.test:50052".into(),
             server_name: "panel.test".into(),

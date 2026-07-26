@@ -152,6 +152,20 @@ xenon-linux-aarch64.tar.gz.sha256
 
 压缩包包含 `xenon`、已嵌入对应架构 Xray 的 `xenon-agent`、systemd 单元、Agent 安装器、项目许可证和 Xray 许可证。Actions artifact 是测试制品；正式发布仍应创建版本标签、保留摘要并完成 Linux E2E 后再对外提供。
 
+### 正式一键安装主控
+
+在面向公网的 Linux 主控机上（x86_64/ARM64 + systemd）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/why1f/Xenon/main/scripts/install-panel.sh | sudo bash
+```
+
+安装器会下载最新 Release、生成自签服务端 CA/证书与 Agent 客户端 CA、写入启用 mTLS 和 Enrollment 的 `/etc/xenon/xenon.toml`，并以 systemd 服务启动主控。有域名时用 `sudo XENON_HOST=panel.example.com bash` 指定；否则自动使用公网 IPv4。
+
+装好后执行 `sudo xenon-tui` 进入 TUI，按 `n` 创建节点，把打印的一行命令拷贝到目标 Linux VPS 以 root 执行即可完成被控 Agent 安装：命令内置架构自适应的 Agent 二进制地址、双架构 SHA-256 和 base64 内嵌的主控 CA，Agent 注册后节点自动上线。
+
+需要放行端口：`50051`（gRPC mTLS）、`50052`（Enrollment）、`18181`（订阅 HTTP）以及各节点的 Xray 端口。
+
 ### 单机一键测试安装
 
 公开仓库可在 x86_64 或 ARM64、使用 systemd 的 Linux 测试机上匿名下载并安装：

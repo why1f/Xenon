@@ -147,6 +147,11 @@ jobs:
           install -m 0644 README.md "$root/README.md"
           tar -C dist -czf "dist/${ARTIFACT}.tar.gz" "$ARTIFACT"
           (cd dist && sha256sum "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256")
+          arch="${ARTIFACT#xenon-linux-}"
+          install -m 0755 "target/${TARGET}/release/xenon-agent" \
+            "dist/xenon-agent-linux-${arch}"
+          (cd dist && sha256sum "xenon-agent-linux-${arch}" \
+            > "xenon-agent-linux-${arch}.sha256")
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -154,6 +159,7 @@ jobs:
           path: |
             dist/${{ matrix.artifact }}.tar.gz
             dist/${{ matrix.artifact }}.tar.gz.sha256
+            dist/xenon-agent-linux-*
           if-no-files-found: error
           retention-days: 14
 
@@ -183,6 +189,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             release-assets/*/*.tar.gz \
             release-assets/*/*.tar.gz.sha256 \
+            release-assets/*/xenon-agent-linux-* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --prerelease \
